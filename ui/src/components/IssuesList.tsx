@@ -1,6 +1,8 @@
 import { startTransition, useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
+import { shouldShowBoardProjectChip, sortBoardIssues, type BoardSortField, type SortDirection } from "@/lib/issue-board";
+import { statusLabel, statusOrder } from "@/lib/issue-status";
 import { useDialog } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
 import { issuesApi } from "../api/issues";
@@ -27,12 +29,7 @@ import type { Issue } from "@paperclipai/shared";
 
 /* ── Helpers ── */
 
-const statusOrder = ["in_progress", "todo", "backlog", "in_review", "blocked", "done", "cancelled"];
 const priorityOrder = ["critical", "high", "medium", "low"];
-
-function statusLabel(status: string): string {
-  return status.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
-}
 
 /* ── View state ── */
 
@@ -44,6 +41,8 @@ export type IssueViewState = {
   projects: string[];
   sortField: "status" | "priority" | "title" | "created" | "updated";
   sortDir: "asc" | "desc";
+  boardSortField: BoardSortField;
+  boardSortDir: SortDirection;
   groupBy: "status" | "priority" | "assignee" | "none";
   viewMode: "list" | "board";
   collapsedGroups: string[];
@@ -57,6 +56,8 @@ const defaultViewState: IssueViewState = {
   projects: [],
   sortField: "updated",
   sortDir: "desc",
+  boardSortField: "updated",
+  boardSortDir: "desc",
   groupBy: "none",
   viewMode: "list",
   collapsedGroups: [],
@@ -299,6 +300,9 @@ export function IssuesList({
   const filtered = useMemo(() => {
     const sourceIssues = normalizedIssueSearch.length > 0 ? searchedIssues : issues;
     const filteredByControls = applyFilters(sourceIssues, viewState, currentUserId);
+    if (viewState.viewMode === "board") {
+      return sortBoardIssues(filteredByControls, viewState.boardSortField, viewState.boardSortDir);
+    }
     return sortIssues(filteredByControls, viewState);
   }, [issues, searchedIssues, viewState, normalizedIssueSearch, currentUserId]);
 
@@ -309,6 +313,10 @@ export function IssuesList({
   });
 
   const activeFilterCount = countActiveFilters(viewState);
+  const showBoardProjectNames = useMemo(
+    () => shouldShowBoardProjectChip(filtered, projectId),
+    [filtered, projectId],
+  );
 
   const groupedContent = useMemo(() => {
     if (viewState.groupBy === "none") {
@@ -424,7 +432,7 @@ export function IssuesList({
                   {activeFilterCount > 0 && (
                     <button
                       className="text-xs text-muted-foreground hover:text-foreground"
-                      onClick={() => updateView({ statuses: [], priorities: [], assignees: [], labels: [] })}
+                      onClick={() => updateView({ statuses: [], priorities: [], assignees: [], labels: [], projects: [] })}
                     >
                       Clear
                     </button>
@@ -567,49 +575,72 @@ export function IssuesList({
             </PopoverContent>
           </Popover>
 
-          {/* Sort (list view only) */}
-          {viewState.viewMode === "list" && (
-            <Popover>
-              <PopoverTrigger asChild>
-                <Button variant="ghost" size="sm" className="text-xs">
-                  <ArrowUpDown className="h-3.5 w-3.5 sm:h-3 sm:w-3 sm:mr-1" />
-                  <span className="hidden sm:inline">Sort</span>
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent align="end" className="w-48 p-0">
-                <div className="p-2 space-y-0.5">
-                  {([
-                    ["status", "Status"],
-                    ["priority", "Priority"],
-                    ["title", "Title"],
-                    ["created", "Created"],
-                    ["updated", "Updated"],
-                  ] as const).map(([field, label]) => (
+          {/* Sort */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button variant="ghost" size="sm" className="text-xs">
+                <ArrowUpDown className="h-3.5 w-3.5 sm:h-3 sm:w-3 sm:mr-1" />
+                <span className="hidden sm:inline">Sort</span>
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="w-48 p-0">
+              <div className="p-2 space-y-0.5">
+                {(viewState.viewMode === "board"
+                  ? ([
+                      ["priority", "Priority"],
+                      ["title", "Title"],
+                      ["created", "Created"],
+                      ["updated", "Updated"],
+                    ] as const)
+                  : ([
+                      ["status", "Status"],
+                      ["priority", "Priority"],
+                      ["title", "Title"],
+                      ["created", "Created"],
+                      ["updated", "Updated"],
+                    ] as const)).map(([field, label]) => {
+                  const isActive = viewState.viewMode === "board"
+                    ? viewState.boardSortField === field
+                    : viewState.sortField === field;
+                  const direction = viewState.viewMode === "board"
+                    ? viewState.boardSortDir
+                    : viewState.sortDir;
+
+                  return (
                     <button
                       key={field}
                       className={`flex items-center justify-between w-full px-2 py-1.5 text-sm rounded-sm ${
-                        viewState.sortField === field ? "bg-accent/50 text-foreground" : "hover:bg-accent/50 text-muted-foreground"
+                        isActive ? "bg-accent/50 text-foreground" : "hover:bg-accent/50 text-muted-foreground"
                       }`}
                       onClick={() => {
+                        if (viewState.viewMode === "board") {
+                          if (viewState.boardSortField === field) {
+                            updateView({ boardSortDir: viewState.boardSortDir === "asc" ? "desc" : "asc" });
+                          } else {
+                            updateView({ boardSortField: field as BoardSortField, boardSortDir: "asc" });
+                          }
+                          return;
+                        }
+
                         if (viewState.sortField === field) {
                           updateView({ sortDir: viewState.sortDir === "asc" ? "desc" : "asc" });
                         } else {
-                          updateView({ sortField: field, sortDir: "asc" });
+                          updateView({ sortField: field as IssueViewState["sortField"], sortDir: "asc" });
                         }
                       }}
                     >
                       <span>{label}</span>
-                      {viewState.sortField === field && (
+                      {isActive && (
                         <span className="text-xs text-muted-foreground">
-                          {viewState.sortDir === "asc" ? "\u2191" : "\u2193"}
+                          {direction === "asc" ? "\u2191" : "\u2193"}
                         </span>
                       )}
                     </button>
-                  ))}
-                </div>
-              </PopoverContent>
-            </Popover>
-          )}
+                  );
+                })}
+              </div>
+            </PopoverContent>
+          </Popover>
 
           {/* Group (list view only) */}
           {viewState.viewMode === "list" && (
@@ -649,7 +680,7 @@ export function IssuesList({
       {isLoading && <PageSkeleton variant="issues-list" />}
       {error && <p className="text-sm text-destructive">{error.message}</p>}
 
-      {!isLoading && filtered.length === 0 && viewState.viewMode === "list" && (
+      {!isLoading && filtered.length === 0 && (
         <EmptyState
           icon={CircleDot}
           message="No issues match the current filters or search."
@@ -658,14 +689,17 @@ export function IssuesList({
         />
       )}
 
-      {viewState.viewMode === "board" ? (
+      {viewState.viewMode === "board" && filtered.length > 0 ? (
         <KanbanBoard
           issues={filtered}
           agents={agents}
+          projects={projects}
+          currentUserId={currentUserId}
+          showProjectNames={showBoardProjectNames}
           liveIssueIds={liveIssueIds}
           onUpdateIssue={onUpdateIssue}
         />
-      ) : (
+      ) : viewState.viewMode === "list" && filtered.length > 0 ? (
         groupedContent.map((group) => (
           <Collapsible
             key={group.key}
@@ -882,7 +916,7 @@ export function IssuesList({
             </CollapsibleContent>
           </Collapsible>
         ))
-      )}
+      ) : null}
     </div>
   );
 }
