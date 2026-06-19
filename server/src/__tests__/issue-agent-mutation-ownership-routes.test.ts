@@ -1074,10 +1074,20 @@ describe("agent issue mutation checkout ownership", () => {
 
   it("allows a CEO-style assigned agent to close its own runless active issue", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
-      allowed: input.action === "tasks:manage_active_checkouts",
+      allowed: input.action === "issue:mutate" || input.action === "tasks:manage_active_checkouts",
       action: input.action,
-      reason: input.action === "tasks:manage_active_checkouts" ? "allow_legacy_agent_creator" : "deny_missing_grant",
-      explanation: input.action === "tasks:manage_active_checkouts" ? "Allowed by legacy agent creator authority." : "Missing permission.",
+      reason:
+        input.action === "tasks:manage_active_checkouts"
+          ? "allow_legacy_agent_creator"
+          : input.action === "issue:mutate"
+            ? "allow_issue_boundary"
+            : "deny_missing_grant",
+      explanation:
+        input.action === "tasks:manage_active_checkouts"
+          ? "Allowed by legacy agent creator authority."
+          : input.action === "issue:mutate"
+            ? "Allowed by test issue boundary."
+            : "Missing permission.",
     }));
     mockAgentService.getById.mockImplementation(async (id: string) => {
       if (id === ownerAgentId) return makeAgent(ownerAgentId, { role: "ceo", permissions: { canCreateAgents: true } });
