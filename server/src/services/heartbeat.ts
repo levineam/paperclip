@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -32,6 +32,7 @@ import {
   approvals,
   companySkills as companySkillsTable,
   companies,
+  costEvents,
   documentAnnotationComments,
   documentAnnotationThreads,
   documentRevisions,
@@ -238,6 +239,7 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const TIMER_ACTIONABLE_ISSUE_STATUSES = ["todo", "in_progress"] as const;
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -6835,7 +6837,95 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+      maxDailyRuns: normalizeOptionalPositiveInteger(
+        heartbeat.maxDailyRuns ?? heartbeat.dailyRunLimit ?? heartbeat.dailyRunCap ?? heartbeat.maxRunsPerDay,
+      ),
+      maxDailyCostCents: normalizeOptionalPositiveInteger(
+        heartbeat.maxDailyCostCents ??
+          heartbeat.dailyCostCentsLimit ??
+          heartbeat.dailySpendCentsLimit ??
+          heartbeat.dailyBudgetCents,
+      ),
     };
+  }
+
+  function normalizeOptionalPositiveInteger(value: unknown) {
+    const normalized = Math.floor(asNumber(value, 0));
+    return normalized > 0 ? normalized : null;
+  }
+
+  function currentUtcDayWindow(now = new Date()) {
+    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0));
+    return { start, end };
+  }
+
+  async function getHeartbeatDailyCapBlock(agent: typeof agents.$inferSelect, policy: ReturnType<typeof parseHeartbeatPolicy>) {
+    const { start, end } = currentUtcDayWindow();
+    if (policy.maxDailyRuns) {
+      const [row] = await db
+        .select({ total: sql<number>`count(*)::integer` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, agent.companyId),
+            eq(heartbeatRuns.agentId, agent.id),
+            gte(heartbeatRuns.createdAt, start),
+            lt(heartbeatRuns.createdAt, end),
+            notInArray(heartbeatRuns.status, ["cancelled"]),
+          ),
+        );
+      const observed = Number(row?.total ?? 0);
+      if (observed >= policy.maxDailyRuns) {
+        return {
+          reason: "heartbeat.daily_run_limit",
+          observed,
+          limit: policy.maxDailyRuns,
+        };
+      }
+    }
+
+    if (policy.maxDailyCostCents) {
+      const [row] = await db
+        .select({ total: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::integer` })
+        .from(costEvents)
+        .where(
+          and(
+            eq(costEvents.companyId, agent.companyId),
+            eq(costEvents.agentId, agent.id),
+            gte(costEvents.occurredAt, start),
+            lt(costEvents.occurredAt, end),
+          ),
+        );
+      const observed = Number(row?.total ?? 0);
+      if (observed >= policy.maxDailyCostCents) {
+        return {
+          reason: "heartbeat.daily_cost_limit",
+          observed,
+          limit: policy.maxDailyCostCents,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
+    const row = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, agent.companyId),
+          eq(issues.assigneeAgentId, agent.id),
+          isNull(issues.assigneeUserId),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return Boolean(row);
   }
 
   function parseMaxTurnContinuationPolicy(agent: typeof agents.$inferSelect): MaxTurnContinuationPolicy {
@@ -10410,6 +10500,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ...patch,
       });
     };
+    const writeSkippedHeartbeatRequest = async (skipReason: string, details: Record<string, unknown>) => {
+      await writeSkippedRequest(skipReason, {
+        payload: {
+          ...(payload ?? {}),
+          heartbeatSkip: details,
+        },
+      });
+    };
 
     const company = await db
       .select({ status: companies.status })
@@ -10520,6 +10618,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
     if (source !== "timer" && !policy.wakeOnDemand) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled");
+      return null;
+    }
+
+    const genericTimerWake =
+      source === "timer" &&
+      !issueId &&
+      !wakeCommentId &&
+      !readNonEmptyString(enrichedContextSnapshot.taskId) &&
+      !readNonEmptyString(enrichedContextSnapshot.taskKey);
+    if (genericTimerWake && !(await hasActionableTimerWork(agent))) {
+      await writeSkippedHeartbeatRequest("heartbeat.timer.no_actionable_work", {
+        reason: "No assigned todo or in_progress issue requires this agent before timer adapter invocation.",
+      });
+      return null;
+    }
+
+    const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, policy);
+    if (dailyCapBlock) {
+      await writeSkippedHeartbeatRequest(dailyCapBlock.reason, {
+        reason: "Per-agent heartbeat daily cap reached before adapter invocation.",
+        observed: dailyCapBlock.observed,
+        limit: dailyCapBlock.limit,
+      });
       return null;
     }
 

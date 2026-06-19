@@ -5,6 +5,7 @@ import {
   agents,
   agentWakeupRequests,
   companies,
+  costEvents,
   createDb,
   documentRevisions,
   documents,
@@ -96,6 +97,7 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
           "issue_tree_holds",
           "issues",
           "heartbeat_run_events",
+          "cost_events",
           "activity_log",
           "heartbeat_runs",
           "agent_wakeup_requests",
@@ -124,6 +126,7 @@ type SeedOptions = {
   agentName?: string;
   agentRole?: string;
   maxConcurrentRuns?: number;
+  heartbeatConfig?: Record<string, unknown>;
 };
 
 type SeedResult = {
@@ -201,6 +204,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         heartbeat: {
           wakeOnDemand: true,
           maxConcurrentRuns: opts.maxConcurrentRuns ?? 1,
+          ...(opts.heartbeatConfig ?? {}),
         },
       },
       permissions: {},
@@ -287,6 +291,164 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       key: ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
     });
   }
+
+  it("skips generic timer wakes with no actionable assigned work before adapter execution", async () => {
+    const { agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+      },
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    const runRows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.timer.no_actionable_work",
+    });
+    expect(wakeup?.payload).toMatchObject({
+      heartbeatSkip: {
+        reason: expect.stringContaining("No assigned todo or in_progress issue"),
+      },
+    });
+    expect(runRows).toHaveLength(0);
+  });
+
+  it("allows generic timer wakes when the agent has assigned todo work", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+      },
+    });
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Assigned work",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    await waitForCondition(async () => countExecuteCallsForRun(run!.id) > 0);
+
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("skips wakes before queueing when per-agent daily run cap is reached", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        maxDailyRuns: 1,
+      },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      triggerDetail: "manual",
+      status: "succeeded",
+      createdAt: new Date(),
+      finishedAt: new Date(),
+      contextSnapshot: {},
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.daily_run_limit",
+    });
+    expect(wakeup?.payload).toMatchObject({
+      heartbeatSkip: {
+        observed: 1,
+        limit: 1,
+      },
+    });
+  });
+
+  it("skips wakes before queueing when per-agent daily cost cap is reached", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        maxDailyCostCents: 75,
+      },
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      provider: "test",
+      biller: "test",
+      billingType: "metered_api",
+      model: "test-model",
+      inputTokens: 100,
+      outputTokens: 50,
+      costCents: 75,
+      occurredAt: new Date(),
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.daily_cost_limit",
+    });
+    expect(wakeup?.payload).toMatchObject({
+      heartbeatSkip: {
+        observed: 75,
+        limit: 75,
+      },
+    });
+  });
 
   it("cancels queued runs when the issue assignee changes before the run starts", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "OriginalCoder" });
