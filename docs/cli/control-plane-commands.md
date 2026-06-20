@@ -35,31 +35,63 @@ pnpm paperclipai issue release <issue-id>
 ```sh
 pnpm paperclipai company list
 pnpm paperclipai company get <company-id>
+pnpm paperclipai company current [--company-id <company-id>]
 
 # Export to portable folder package (writes manifest + markdown files)
 pnpm paperclipai company export <company-id> --out ./exports/acme --include company,agents
 
 # Preview import (no writes)
 pnpm paperclipai company import \
-  --from https://github.com/<owner>/<repo>/tree/main/<path> \
+  <owner>/<repo>/<path> \
   --target existing \
   --company-id <company-id> \
+  --ref main \
   --collision rename \
   --dry-run
 
 # Apply import
 pnpm paperclipai company import \
-  --from ./exports/acme \
+  ./exports/acme \
   --target new \
   --new-company-name "Acme Imported" \
   --include company,agents
 ```
+
+With agent authentication, use `company list` or `company current` to resolve
+the scoped company. `company list` first tries the board-wide list; if that is
+forbidden, it falls back to `--company-id`, `PAPERCLIP_COMPANY_ID`, context, or
+`/api/agents/me` and returns only that scoped company. `company create` requires
+board/instance-admin authentication because it is an instance-wide setup
+command.
 
 ## Agent Commands
 
 ```sh
 pnpm paperclipai agent list
 pnpm paperclipai agent get <agent-id>
+```
+
+## Skills Commands
+
+```sh
+# Browse app-shipped catalog skills without changing company state
+pnpm paperclipai skills browse [--kind bundled|optional] [--category software-development] [--query github]
+pnpm paperclipai skills search "pull request" [--json]
+
+# Inspect catalog metadata and file inventory before install
+pnpm paperclipai skills inspect github-pr-workflow
+
+# Install a catalog skill into the company skill library
+# This does not attach the skill to any agent.
+pnpm paperclipai skills install github-pr-workflow --company-id <company-id>
+pnpm paperclipai skills install github-pr-workflow --as pr-flow --force --company-id <company-id>
+
+# External sources still use import instead of catalog install
+pnpm paperclipai skills import ./skills/my-skill --company-id <company-id>
+pnpm paperclipai skills import owner/repo/path/to/skill --company-id <company-id>
+
+# Attach desired company skills to an agent after install/import
+pnpm paperclipai skills agent sync <agent-id> --skill github-pr-workflow --company-id <company-id>
 ```
 
 ## Approval Commands

@@ -3,7 +3,15 @@ import type {
   AdapterExecutionResult,
   AdapterRuntimeServiceReport,
 } from "@paperclipai/adapter-utils";
-import { asNumber, asString, buildPaperclipEnv, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import {
+  asNumber,
+  asString,
+  buildPaperclipEnv,
+  parseObject,
+  readPaperclipIssueWorkModeFromContext,
+  renderPaperclipWakePrompt,
+  stringifyPaperclipWakePayload,
+} from "@paperclipai/adapter-utils/server-utils";
 import crypto, { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 
@@ -126,7 +134,12 @@ function normalizeSessionKeyStrategy(value: unknown): SessionKeyStrategy {
   return "issue";
 }
 
-function resolveSessionKey(input: {
+function prefixSessionKeyForAgent(sessionKey: string, agentId: string | null): string {
+  if (!agentId || sessionKey.startsWith("agent:")) return sessionKey;
+  return `agent:${agentId}:${sessionKey}`;
+}
+
+export function resolveSessionKey(input: {
   strategy: SessionKeyStrategy;
   configuredSessionKey: string | null;
   runId: string;
@@ -134,17 +147,13 @@ function resolveSessionKey(input: {
   agentId: string | null;
 }): string {
   const fallback = input.configuredSessionKey ?? "paperclip";
-  // When an agentId is configured, prefix generated keys with "agent:{id}:" so the
-  // OpenClaw gateway resolves the correct agent from the session key. Without this
-  // prefix the gateway falls back to the authenticated agent (usually "main") and
-  // rejects the request when agentId doesn't match.
-  const prefix = input.agentId ? `agent:${input.agentId}:` : "";
-  if (input.strategy === "run") return `${prefix}paperclip:run:${input.runId}`;
-  if (input.strategy === "issue" && input.issueId) return `${prefix}paperclip:issue:${input.issueId}`;
-  // For "fixed" strategy, only apply prefix when the configured key doesn't already
-  // contain an agent segment (avoid double-prefixing).
-  if (input.agentId && !fallback.startsWith("agent:")) return `${prefix}${fallback}`;
-  return fallback;
+  if (input.strategy === "run") {
+    return prefixSessionKeyForAgent(`paperclip:run:${input.runId}`, input.agentId);
+  }
+  if (input.strategy === "issue" && input.issueId) {
+    return prefixSessionKeyForAgent(`paperclip:issue:${input.issueId}`, input.agentId);
+  }
+  return prefixSessionKeyForAgent(fallback, input.agentId);
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -234,7 +243,11 @@ function resolveAuthToken(config: Record<string, unknown>, headers: Record<strin
   const authHeader =
     headerMapGetIgnoreCase(headers, "x-openclaw-auth") ??
     headerMapGetIgnoreCase(headers, "authorization");
-  return tokenFromAuthHeader(authHeader);
+  const fromHeader = tokenFromAuthHeader(authHeader);
+  if (fromHeader) return fromHeader;
+
+  // Fallback to environment variable
+  return nonEmpty(process.env.OPENCLAW_TOKEN);
 }
 
 function isSensitiveLogKey(key: string): boolean {
@@ -322,6 +335,12 @@ function resolvePaperclipApiUrlOverride(value: unknown): string | null {
   }
 }
 
+const DEFAULT_CLAIMED_API_KEY_PATH = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
+
+function resolveClaimedApiKeyPath(value: unknown): string {
+  return nonEmpty(value) ?? DEFAULT_CLAIMED_API_KEY_PATH;
+}
+
 function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: WakePayload): Record<string, string> {
   const paperclipApiUrlOverride = resolvePaperclipApiUrlOverride(ctx.config.paperclipApiUrl);
   const paperclipEnv: Record<string, string> = {
@@ -333,6 +352,8 @@ function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: Wak
     paperclipEnv.PAPERCLIP_API_URL = paperclipApiUrlOverride;
   }
   if (wakePayload.taskId) paperclipEnv.PAPERCLIP_TASK_ID = wakePayload.taskId;
+  const issueWorkMode = readPaperclipIssueWorkModeFromContext(ctx.context);
+  if (issueWorkMode) paperclipEnv.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
   if (wakePayload.wakeReason) paperclipEnv.PAPERCLIP_WAKE_REASON = wakePayload.wakeReason;
   if (wakePayload.wakeCommentId) paperclipEnv.PAPERCLIP_WAKE_COMMENT_ID = wakePayload.wakeCommentId;
   if (wakePayload.approvalId) paperclipEnv.PAPERCLIP_APPROVAL_ID = wakePayload.approvalId;
@@ -344,7 +365,11 @@ function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: Wak
   return paperclipEnv;
 }
 
-function buildWakeText(payload: WakePayload, paperclipEnv: Record<string, string>): string {
+function buildWakeText(
+  payload: WakePayload,
+  paperclipEnv: Record<string, string>,
+  structuredWakePrompt: string,
+): string {
   const claimedApiKeyPath = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
@@ -399,20 +424,30 @@ function buildWakeText(payload: WakePayload, paperclipEnv: Record<string, string
     "1) GET /api/agents/me",
     `2) Determine issueId: PAPERCLIP_TASK_ID if present, otherwise issue_id (${issueIdHint}).`,
     "3) If issueId exists:",
-    "   - POST /api/issues/{issueId}/checkout with {\"agentId\":\"$PAPERCLIP_AGENT_ID\",\"expectedStatuses\":[\"todo\",\"backlog\",\"blocked\"]}",
+    "   - POST /api/issues/{issueId}/checkout with {\"agentId\":\"$PAPERCLIP_AGENT_ID\",\"expectedStatuses\":[\"todo\",\"backlog\",\"blocked\",\"in_review\"]}",
     "   - GET /api/issues/{issueId}",
     "   - GET /api/issues/{issueId}/comments",
-    "   - Execute the issue instructions exactly.",
+    "   - Execute the issue instructions exactly. If the issue is actionable, take concrete action in this run; do not stop at a plan unless planning was requested.",
+    "   - Leave durable progress with a clear next action. Use child issues for long or parallel delegated work instead of polling agents, sessions, or processes.",
+    "   - Create child issues directly when you know what needs to be done; use POST /api/issues/{issueId}/interactions with kind suggest_tasks, ask_user_questions, or request_confirmation when the board/user must choose, answer, or confirm before you can continue.",
+    "   - For plan approval, update the plan document first, then create request_confirmation targeting the latest plan revision with idempotencyKey confirmation:{issueId}:plan:{revisionId}; wait for acceptance before creating implementation subtasks.",
+    "   - If blocked, PATCH /api/issues/{issueId} with {\"status\":\"blocked\",\"comment\":\"what is blocked, who owns the unblock, and the next action\"}.",
     "   - If instructions require a comment, POST /api/issues/{issueId}/comments with {\"body\":\"...\"}.",
     "   - PATCH /api/issues/{issueId} with {\"status\":\"done\",\"comment\":\"what changed and why\"}.",
     "4) If issueId does not exist:",
-    "   - GET /api/companies/$PAPERCLIP_COMPANY_ID/issues?assigneeAgentId=$PAPERCLIP_AGENT_ID&status=todo,in_progress,blocked",
-    "   - Pick in_progress first, then todo, then blocked, then execute step 3.",
+    "   - GET /api/companies/$PAPERCLIP_COMPANY_ID/issues?assigneeAgentId=$PAPERCLIP_AGENT_ID&status=todo,in_progress,in_review,blocked",
+    "   - Pick in_progress first, then in_review when you were woken by a comment, then todo, then blocked, then execute step 3.",
     "",
     "Useful endpoints for issue work:",
     "- POST /api/issues/{issueId}/comments",
     "- PATCH /api/issues/{issueId}",
     "- POST /api/companies/{companyId}/issues (when asked to create a new issue)",
+    ...(structuredWakePrompt
+      ? [
+          "",
+          structuredWakePrompt,
+        ]
+      : []),
     "",
     "Complete the workflow in this run.",
   ];
@@ -422,6 +457,17 @@ function buildWakeText(payload: WakePayload, paperclipEnv: Record<string, string
 function appendWakeText(baseText: string, wakeText: string): string {
   const trimmedBase = baseText.trim();
   return trimmedBase.length > 0 ? `${trimmedBase}\n\n${wakeText}` : wakeText;
+}
+
+function joinWakePayloadSections(structuredWakePrompt: string, structuredWakeJson: string): string {
+  const sections = [
+    structuredWakePrompt.trim(),
+    "Structured wake payload JSON:",
+    "```json",
+    structuredWakeJson,
+    "```",
+  ].filter((entry) => entry.trim().length > 0);
+  return sections.join("\n");
 }
 
 function buildStandardPaperclipPayload(
@@ -456,6 +502,10 @@ function buildStandardPaperclipPayload(
     approvalStatus: wakePayload.approvalStatus,
     apiUrl: paperclipEnv.PAPERCLIP_API_URL ?? null,
   };
+  const structuredWake = parseObject(ctx.context.paperclipWake);
+  if (Object.keys(structuredWake).length > 0) {
+    standardPaperclip.wake = structuredWake;
+  }
 
   if (workspace) {
     standardPaperclip.workspace = workspace;
@@ -614,6 +664,7 @@ class GatewayWsClient {
       this.resolveChallenge = resolve;
       this.rejectChallenge = reject;
     });
+    this.challengePromise.catch(() => {});
   }
 
   async connect(
@@ -1061,7 +1112,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const wakePayload = buildWakePayload(ctx);
   const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
-  const wakeText = buildWakeText(wakePayload, paperclipEnv);
+  const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake);
+  const structuredWakeJson = stringifyPaperclipWakePayload(ctx.context.paperclipWake);
+  const wakeText = buildWakeText(
+    wakePayload,
+    paperclipEnv,
+    structuredWakeJson
+      ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
+      : structuredWakePrompt,
+  );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
   const configuredSessionKey = nonEmpty(ctx.config.sessionKey);
@@ -1085,6 +1144,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
+  agentParams.paperclip = paperclipPayload;
 
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
     agentParams.agentId = configuredAgentId;
@@ -1129,6 +1189,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const autoPairOnFirstConnect = parseBoolean(ctx.config.autoPairOnFirstConnect, true);
   let autoPairAttempted = false;
   let latestResultPayload: unknown = null;
+  let retryCount = 0;
+  const MAX_RETRIES = 2;
 
   while (true) {
     const trackedRunIds = new Set<string>([ctx.runId]);
@@ -1416,6 +1478,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "stderr",
           `[openclaw-gateway] auto-pairing failed: ${pairResult.reason}\n`,
         );
+      }
+
+      // Retry transient errors (connection refused, reset, socket hang up)
+      const isTransient =
+        !pairingRequired &&
+        (lower.includes("econnrefused") ||
+          lower.includes("econnreset") ||
+          lower.includes("socket hang up") ||
+          (timedOut && !lower.includes("agent.wait")));
+
+      if (isTransient && retryCount < MAX_RETRIES) {
+        retryCount++;
+        const backoffMs = retryCount * 2000;
+        await ctx.onLog(
+          "stdout",
+          `[openclaw-gateway] transient error, retry ${retryCount}/${MAX_RETRIES} after ${backoffMs}ms: ${message}\n`,
+        );
+        await new Promise((r) => setTimeout(r, backoffMs));
+        continue;
       }
 
       const detailedMessage = pairingRequired

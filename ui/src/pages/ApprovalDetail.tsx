@@ -8,7 +8,7 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { queryKeys } from "../lib/queryKeys";
 import { StatusBadge } from "../components/StatusBadge";
 import { Identity } from "../components/Identity";
-import { typeLabel, typeIcon, defaultTypeIcon, ApprovalPayloadRenderer } from "../components/ApprovalPayload";
+import { approvalLabel, typeIcon, defaultTypeIcon, ApprovalPayloadRenderer } from "../components/ApprovalPayload";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -156,8 +156,8 @@ export function ApprovalDetail() {
       ? {
           label:
             (linkedIssues?.length ?? 0) > 1
-              ? "Review linked issues"
-              : "Review linked issue",
+              ? "Review linked tasks"
+              : "Review linked task",
           to: `/issues/${primaryLinkedIssue.identifier ?? primaryLinkedIssue.id}`,
         }
       : linkedAgentId
@@ -183,7 +183,7 @@ export function ApprovalDetail() {
               <div>
                 <p className="text-sm text-green-800 dark:text-green-100 font-medium">Approval confirmed</p>
                 <p className="text-xs text-green-700 dark:text-green-200/90">
-                  Requesting agent was notified to review this approval and linked issues.
+                  Requesting agent was notified to review this approval and linked tasks.
                 </p>
               </div>
             </div>
@@ -203,7 +203,7 @@ export function ApprovalDetail() {
           <div className="flex items-center gap-2">
             <TypeIcon className="h-5 w-5 text-muted-foreground shrink-0" />
             <div>
-              <h2 className="text-lg font-semibold">{typeLabel[approval.type] ?? approval.type.replace(/_/g, " ")}</h2>
+              <h2 className="text-lg font-semibold">{approvalLabel(approval.type, approval.payload as Record<string, unknown> | null)}</h2>
               <p className="text-xs text-muted-foreground font-mono">{approval.id}</p>
             </div>
           </div>
@@ -240,7 +240,7 @@ export function ApprovalDetail() {
         {error && <p className="text-sm text-destructive">{error}</p>}
         {linkedIssues && linkedIssues.length > 0 && (
           <div className="pt-2 border-t border-border/60">
-            <p className="text-xs text-muted-foreground mb-1.5">Linked Issues</p>
+            <p className="text-xs text-muted-foreground mb-1.5">Linked Tasks</p>
             <div className="space-y-1.5">
               {linkedIssues.map((issue) => (
                 <Link
@@ -256,7 +256,7 @@ export function ApprovalDetail() {
               ))}
             </div>
             <p className="text-[11px] text-muted-foreground mt-2">
-              Linked issues remain open until the requesting agent follows up and closes them.
+              Linked tasks remain open until the requesting agent follows up and closes them.
             </p>
           </div>
         )}
