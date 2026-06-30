@@ -48,11 +48,14 @@ export interface InstanceExperimentalSettings {
   enableEnvironments: boolean;
   enableIsolatedWorkspaces: boolean;
   enableStreamlinedLeftNavigation: boolean;
+  enablePipelines: boolean;
   enableConferenceRoomChat: boolean;
+  enableTaskWatchdogs: boolean;
   enableIssuePlanDecompositions: boolean;
   enableExperimentalFileViewer: boolean;
-  enableTaskWatchdogs: boolean;
   enableCloudSync: boolean;
+  enableExternalObjects: boolean;
+  enableServerInfoDebugView: boolean;
   autoRestartDevServerWhenIdle: boolean;
   enableIssueGraphLivenessAutoRecovery: boolean;
   issueGraphLivenessAutoRecoveryLookbackHours: number;
@@ -60,6 +63,7 @@ export interface InstanceExperimentalSettings {
 
 export interface InstanceSettings {
   id: string;
+  defaultEnvironmentId: string | null;
   general: InstanceGeneralSettings;
   experimental: InstanceExperimentalSettings;
   createdAt: Date;

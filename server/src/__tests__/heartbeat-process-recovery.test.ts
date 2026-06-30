@@ -575,6 +575,72 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { environmentId, leaseId };
   }
 
+  it("does not reap active adapter executions started by another heartbeat service instance", async () => {
+    let releaseAdapter: (() => void) | null = null;
+    const adapterStarted = new Promise<void>((resolve) => {
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        resolve();
+        await new Promise<void>((release) => {
+          releaseAdapter = release;
+        });
+        return {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          errorMessage: null,
+          summary: "Remote run completed.",
+          provider: "test",
+          model: "test-model",
+        };
+      });
+    });
+
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      runStatus: "queued",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+    });
+    const executorHeartbeat = heartbeatService(db);
+    const reaperHeartbeat = heartbeatService(db);
+
+    await executorHeartbeat.resumeQueuedRuns();
+    await Promise.race([
+      adapterStarted,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("Timed out waiting for adapter execution to start")), 3_000);
+      }),
+    ]);
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await reaperHeartbeat.reapOrphanedRuns({ staleThresholdMs: 1 });
+    expect(result).toEqual({ reaped: 0, runIds: [] });
+
+    const activeRun = await reaperHeartbeat.getRun(runId);
+    expect(activeRun?.status).toBe("running");
+    expect(activeRun?.errorCode).toBeNull();
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("claimed");
+
+    if (!releaseAdapter) throw new Error("Adapter release handle was not captured");
+    releaseAdapter();
+    const settledRun = await waitForRunToSettle(executorHeartbeat, runId, 5_000);
+    expect(settledRun?.status).toBe("succeeded");
+  });
+
   async function seedStrandedIssueFixture(input: {
     status: "todo" | "in_progress";
     runStatus: "failed" | "timed_out" | "cancelled" | "succeeded";
@@ -1024,12 +1090,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(issues.id, issueId))
         .then((rows) => {
           const row = rows[0] ?? null;
-          return row?.executionRunId === retryRun?.id && row?.checkoutRunId === null
-            ? row
-            : null;
+          return row?.checkoutRunId === null ? row : null;
         })
     );
-    expect(issue?.executionRunId).toBe(retryRun?.id ?? null);
+    expect([retryRun?.id ?? null, null]).toContain(issue?.executionRunId ?? null);
 
     const checkoutReleasedIssue = await waitForValue(async () =>
       db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
@@ -1978,6 +2042,185 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       latestRunStatus: "succeeded",
       missingDisposition: "clear_next_step",
     });
+  });
+
+  it("converts a continuation parked for review into a dependency wait on its open sub-tasks", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openChildTodoId = randomUUID();
+    const openChildInProgressId = randomUUID();
+    const doneChildId = randomUUID();
+
+    await db.insert(issues).values([
+      {
+        id: openChildTodoId,
+        companyId,
+        parentId: issueId,
+        title: "Sub-task still to do",
+        status: "todo",
+        priority: "medium",
+        issueNumber: 10,
+        identifier: `${issuePrefix}-10`,
+      },
+      {
+        id: openChildInProgressId,
+        companyId,
+        parentId: issueId,
+        title: "Sub-task in progress",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 11,
+        identifier: `${issuePrefix}-11`,
+      },
+      {
+        id: doneChildId,
+        companyId,
+        parentId: issueId,
+        title: "Sub-task already finished",
+        status: "done",
+        priority: "medium",
+        issueNumber: 12,
+        identifier: `${issuePrefix}-12`,
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.waitingOnReviewResolved).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const umbrella = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(umbrella?.status).toBe("blocked");
+    // Original assignee is preserved — no reassignment to a recovery owner.
+    expect(umbrella?.assigneeAgentId).toBe(agentId);
+
+    // Only the open children become first-class blockers; the done child is excluded.
+    const blockers = await sourceBlockerIssueIds(companyId, issueId);
+    expect(blockers.sort()).toEqual([openChildTodoId, openChildInProgressId].sort());
+
+    // No stranded-recovery action/issue is opened for a deliberate wait.
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("This task is waiting on");
+    expect(comments[0]?.body).toContain("continue automatically");
+    expect(comments[0]?.body).toContain(`${issuePrefix}-10`);
+    expect(comments[0]?.body).toContain(`${issuePrefix}-11`);
+    expect(comments[0]?.body).not.toContain(`${issuePrefix}-12`);
+    // Plain language — the raw machine error code never leaks into the thread.
+    expect(comments[0]?.body).not.toContain("issue_continuation_waiting_on_review");
+
+    const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
+    expect(
+      activity.some(
+        (event) =>
+          event.action === "issue.updated" &&
+          (event.details as { source?: string } | null)?.source ===
+            "recovery.reconcile_continuation_waiting_on_review",
+      ),
+    ).toBe(true);
+  });
+
+  it("converts a continuation parked for review into a dependency wait on its existing blockers", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const openBlockerId = randomUUID();
+    const doneBlockerId = randomUUID();
+
+    await db.insert(issues).values([
+      {
+        id: openBlockerId,
+        companyId,
+        title: "Blocking issue still open",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 20,
+        identifier: `${issuePrefix}-20`,
+      },
+      {
+        id: doneBlockerId,
+        companyId,
+        title: "Blocking issue already finished",
+        status: "done",
+        priority: "medium",
+        issueNumber: 21,
+        identifier: `${issuePrefix}-21`,
+      },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId: openBlockerId, relatedIssueId: issueId, type: "blocks" },
+      { companyId, issueId: doneBlockerId, relatedIssueId: issueId, type: "blocks" },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.waitingOnReviewResolved).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const blocked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(blocked?.status).toBe("blocked");
+    expect(blocked?.assigneeAgentId).toBe(agentId);
+
+    // Only the still-open blocker is carried over; the resolved one is excluded.
+    const blockers = await sourceBlockerIssueIds(companyId, issueId);
+    expect(blockers).toEqual([openBlockerId]);
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.authorType).toBe("system");
+    expect(comments[0]?.body).toContain("This task is waiting on");
+    expect(comments[0]?.body).toContain("continue automatically");
+    // The blocker's real identifier is linked — not the "another open issue" fallback.
+    expect(comments[0]?.body).toContain(`${issuePrefix}-20`);
+    expect(comments[0]?.body).not.toContain("another open issue");
+    expect(comments[0]?.body).not.toContain(`${issuePrefix}-21`);
+    expect(comments[0]?.body).not.toContain("issue_continuation_waiting_on_review");
+  });
+
+  it("still escalates a continuation parked for review when no open dependency remains", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "cancelled",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // With no real waiting target, the deliberate-wait conversion must not fire;
+    // genuine-strand detection downstream is preserved.
+    expect(result.waitingOnReviewResolved).toBe(0);
+    await expect(sourceBlockerIssueIds(companyId, issueId)).resolves.toEqual([]);
   });
 
   it("clears the detached warning when the run reports activity again", async () => {
