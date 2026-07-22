@@ -64,6 +64,9 @@ describe("parseGrokJsonl", () => {
 describe("isGrokUnknownSessionError", () => {
   it("detects stale resume failures", () => {
     expect(isGrokUnknownSessionError("", "session not found")).toBe(true);
+    // The Grok CLI's live phrasing for a missing --resume target (2026-07-22).
+    expect(isGrokUnknownSessionError("", "Error: Session does not exist")).toBe(true);
+    expect(isGrokUnknownSessionError("Session 019f-abc does not exist", "")).toBe(true);
     expect(isGrokUnknownSessionError("", "everything fine")).toBe(false);
   });
 });

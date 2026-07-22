@@ -85,5 +85,9 @@ export function isGrokUnknownSessionError(stdout: string, stderr: string): boole
     .filter(Boolean)
     .join("\n");
 
-  return /unknown\s+session|session(?:\s+.*)?\s+not\s+found|resume\s+.*\s+not\s+found|invalid\s+session/i.test(haystack);
+  // "does not exist" is the phrasing the Grok CLI actually emits for a
+  // missing --resume target (observed live 2026-07-22: "Error: Session does
+  // not exist"); without it the fresh-session retry in execute.ts never fires
+  // and the whole run hard-fails on what should be a self-healing condition.
+  return /unknown\s+session|session(?:\s+.*)?\s+not\s+found|session(?:\s+.*)?\s+does\s+not\s+exist|resume\s+.*\s+not\s+found|invalid\s+session/i.test(haystack);
 }
