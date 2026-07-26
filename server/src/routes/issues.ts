@@ -1999,15 +1999,7 @@ export function issueRoutes(
   async function assertAgentIssueCommentAllowed(
     req: Request,
     res: Response,
-    issue: {
-      id: string;
-      companyId: string;
-      projectId: string | null;
-      parentId: string | null;
-      status: string;
-      assigneeAgentId: string | null;
-      assigneeUserId: string | null;
-    },
+    issue: IssueRouteSnapshot,
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -2032,6 +2024,7 @@ export function issueRoutes(
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
     if (!boundaryDecision.allowed) {
+      if (await activeRecoveryOwnerAllowsAgentBoundaryOverride(req, issue)) return true;
       res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
       return false;
     }
@@ -2077,18 +2070,42 @@ export function issueRoutes(
     return decision.allowed;
   }
 
+  async function activeRecoveryOwnerAllowsAgentBoundaryOverride(
+    req: Request,
+    issue: IssueRouteSnapshot,
+  ) {
+    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
+
+    try {
+      const revalidatedRecoveryAction = await revalidateActiveSourceRecovery({
+        issue,
+        trigger: "read_projection",
+        actor: getActorInfo(req),
+      });
+      if (!revalidatedRecoveryAction) return false;
+
+      const currentRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
+        issue.companyId,
+        issue.id,
+      );
+      return (
+        currentRecoveryAction?.id === revalidatedRecoveryAction.id &&
+        currentRecoveryAction.ownerAgentId === req.actor.agentId
+      );
+    } catch (err) {
+      logger.warn(
+        { err, issueId: issue.id, actorAgentId: req.actor.agentId },
+        "failed to evaluate recovery owner boundary override",
+      );
+      return false;
+    }
+  }
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
-    issue: {
-      id: string;
-      companyId: string;
-      projectId: string | null;
-      parentId: string | null;
-      status: string;
-      assigneeAgentId: string | null;
-      assigneeUserId: string | null;
-    },
+    issue: IssueRouteSnapshot,
+    options: { allowRecoveryOwnerBoundaryOverride?: boolean } = {},
   ) {
     if (req.actor.type !== "agent") return true;
     const actorAgentId = req.actor.agentId;
@@ -2121,6 +2138,12 @@ export function issueRoutes(
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
     if (!boundaryDecision.allowed) {
+      if (
+        options.allowRecoveryOwnerBoundaryOverride === true &&
+        await activeRecoveryOwnerAllowsAgentBoundaryOverride(req, issue)
+      ) {
+        return true;
+      }
       res.status(403).json({ error: "Issue is outside this actor's authorization boundary" });
       return false;
     }
@@ -3694,7 +3717,11 @@ export function issueRoutes(
       return;
     }
     assertCompanyAccess(req, existing.companyId);
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    if (!(
+      await assertAgentIssueMutationAllowed(req, res, existing, {
+        allowRecoveryOwnerBoundaryOverride: true,
+      })
+    )) return;
     const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(existing.companyId, existing.id);
     if (
       !(await assertRecoveryActionAuthority(
@@ -5770,7 +5797,11 @@ export function issueRoutes(
     }
     assertCompanyAccess(req, existing.companyId);
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
-    if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
+    if (!(
+      await assertAgentIssueMutationAllowed(req, res, existing, {
+        allowRecoveryOwnerBoundaryOverride: true,
+      })
+    )) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
     const actor = getActorInfo(req);
