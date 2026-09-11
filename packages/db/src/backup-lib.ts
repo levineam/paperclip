@@ -6,6 +6,11 @@ import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
+import {
+  acquireStorageTransactionLock,
+  isStorageTransactionReservedArtifact,
+  type StorageTransactionLockHandle,
+} from "./backup-transaction-lock.js";
 
 export type BackupRetentionPolicy = {
   dailyDays: number;
@@ -114,7 +119,12 @@ function monthKey(date: Date): string {
  * - Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
  * - Everything else is deleted
  */
-function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
+function pruneOldBackups(
+  backupDir: string,
+  retention: BackupRetentionPolicy,
+  filenamePrefix: string,
+  lock: StorageTransactionLockHandle,
+): number {
   if (!existsSync(backupDir)) return 0;
 
   const now = Date.now();
@@ -126,6 +136,7 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   const entries: BackupEntry[] = [];
 
   for (const name of readdirSync(backupDir)) {
+    if (isStorageTransactionReservedArtifact(name)) continue;
     if (!name.startsWith(`${filenamePrefix}-`)) continue;
     if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
     const fullPath = resolve(backupDir, name);
@@ -173,6 +184,7 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
   }
 
   for (const filePath of toDelete) {
+    lock.assertOwned();
     unlinkSync(filePath);
   }
 
@@ -534,6 +546,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     await sql.end();
   };
   mkdirSync(opts.backupDir, { recursive: true });
+  const lock = acquireStorageTransactionLock({
+    sourceRoot: opts.backupDir,
+    operationKind: "database-backup",
+    maintainParticipationMarker: true,
+  });
+  let transactionReady = false;
   const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
   const writer = createBufferedTextFileWriter(sqlFile);
@@ -550,7 +568,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix, lock);
+        transactionReady = true;
         return {
           backupFile,
           sizeBytes,
@@ -962,7 +981,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
-    const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+    const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix, lock);
+    transactionReady = true;
 
     return {
       backupFile,
@@ -977,9 +997,18 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     if (existsSync(sqlFile)) {
       try { unlinkSync(sqlFile); } catch { /* ignore */ }
     }
+    transactionReady = !existsSync(backupFile) && !existsSync(sqlFile);
     throw error;
   } finally {
-    await closeSql();
+    try {
+      await closeSql();
+    } finally {
+      try {
+        if (transactionReady) lock.markParticipationReady();
+      } finally {
+        lock.release();
+      }
+    }
   }
 }
 

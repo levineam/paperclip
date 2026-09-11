@@ -4,6 +4,11 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  StorageTransactionBusyError,
+  acquireStorageTransactionLock,
+  readStorageTransactionParticipationMarker,
+} from "./backup-transaction-lock.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -70,6 +75,38 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("runDatabaseBackup storage transaction", () => {
+  it("fails with a typed busy result before contacting the database", async () => {
+    const backupDir = createTempDir("paperclip-db-backup-busy-");
+    const held = acquireStorageTransactionLock({ sourceRoot: backupDir });
+    try {
+      await expect(runDatabaseBackup({
+        connectionString: "postgres://paperclip:paperclip@127.0.0.1:1/paperclip",
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        backupEngine: "javascript",
+      })).rejects.toBeInstanceOf(StorageTransactionBusyError);
+    } finally {
+      held.release();
+    }
+  });
+
+  it("releases ownership and marks a cleaned failed attempt ready", async () => {
+    const backupDir = createTempDir("paperclip-db-backup-failed-");
+    await expect(runDatabaseBackup({
+      connectionString: "postgres://paperclip:paperclip@127.0.0.1:1/paperclip",
+      backupDir,
+      retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+      backupEngine: "javascript",
+      connectTimeoutSeconds: 1,
+    })).rejects.toThrow();
+
+    expect(readStorageTransactionParticipationMarker(backupDir)).toMatchObject({ state: "ready" });
+    expect(fs.readdirSync(backupDir).some((name) => name.endsWith(".sql") || name.endsWith(".sql.gz")))
+      .toBe(false);
   });
 });
 
