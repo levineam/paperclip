@@ -5,74 +5,82 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX,
+  STORAGE_TRANSACTION_LOCK_DIR_NAME,
   STORAGE_TRANSACTION_LOCK_SCHEMA,
-  StorageTransactionBlockedError,
-  StorageTransactionBusyError,
+  STORAGE_TRANSACTION_PARTICIPATION_NAME,
+  STORAGE_TRANSACTION_RESERVED_PREFIX,
+  StorageTransactionLockError,
   acquireStorageTransactionLock,
+  assertStorageTransactionLockHeld,
   checkStorageTransactionLiveness,
-  isStorageTransactionReservedArtifact,
-  readStorageTransactionParticipationMarker,
-  type StorageTransactionIdentity,
-  type StorageTransactionLockDeps,
-  type StorageTransactionLockRecord,
+  isStorageTransactionReservedName,
+  parseStorageTransactionOwnerRecord,
+  readLocalBootId,
+  readLocalMachineId,
+  readProcessStartId,
+  readStorageTransactionParticipation,
+  releaseStorageTransactionLock,
+  resolveSourceRootRealPath,
+  type StorageTransactionOwnerRecord,
 } from "./backup-transaction-lock.js";
 
-const cleanup: Array<() => void> = [];
+const cleanupRoots: string[] = [];
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const modulePath = path.resolve(packageRoot, "src/backup-transaction-lock.ts");
 const tsxPath = path.resolve(packageRoot, "node_modules/tsx/dist/cli.mjs");
 
 afterEach(() => {
-  while (cleanup.length > 0) cleanup.pop()?.();
+  while (cleanupRoots.length > 0) {
+    fs.rmSync(cleanupRoots.pop()!, { recursive: true, force: true });
+  }
 });
 
 function tempDir(prefix: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  cleanupRoots.push(dir);
   return dir;
 }
 
-function identity(overrides: Partial<StorageTransactionIdentity> = {}): StorageTransactionIdentity {
+function writeOwner(root: string, overrides: Record<string, unknown> = {}) {
+  const realRoot = resolveSourceRootRealPath(root);
+  const ownerPath = path.join(realRoot, STORAGE_TRANSACTION_LOCK_DIR_NAME);
+  const owner = {
+    schema: STORAGE_TRANSACTION_LOCK_SCHEMA,
+    token: "FAKESECRET_g1h2i3j4k5l6m7n8o9p0",
+    machineId: readLocalMachineId(),
+    bootId: readLocalBootId(),
+    pid: 2_147_483_646,
+    processStartId: "dead-process-start-id",
+    operationKind: "backup",
+    acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+    ...overrides,
+  };
+  fs.writeFileSync(ownerPath, `${JSON.stringify(owner)}\n`, { mode: 0o600 });
+  return owner;
+}
+
+function ownerRecord(overrides: Partial<StorageTransactionOwnerRecord> = {}): StorageTransactionOwnerRecord {
   return {
+    schema: STORAGE_TRANSACTION_LOCK_SCHEMA,
+    token: "existing-token",
     machineId: "machine-a",
     bootId: "boot-a",
     pid: 4100,
     processStartId: "start-4100",
-    ...overrides,
-  };
-}
-
-function deps(
-  current: StorageTransactionIdentity,
-  overrides: Partial<StorageTransactionLockDeps> = {},
-): StorageTransactionLockDeps {
-  return {
-    resolveIdentity: () => current,
-    createToken: () => `token-${current.pid}`,
-    checkLiveness: (record, observed) => checkStorageTransactionLiveness(record, observed),
-    now: () => new Date("2026-09-11T12:00:00.000Z"),
-    ...overrides,
-  };
-}
-
-function ownerPath(root: string): string {
-  return path.join(root, `${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}owner`);
-}
-
-function writeOwner(root: string, record: StorageTransactionLockRecord): void {
-  fs.writeFileSync(ownerPath(root), `${JSON.stringify(record)}\n`, { mode: 0o600 });
-}
-
-function record(overrides: Partial<StorageTransactionLockRecord> = {}): StorageTransactionLockRecord {
-  return {
-    schema: STORAGE_TRANSACTION_LOCK_SCHEMA,
-    ...identity(),
-    token: "existing-token",
-    operationKind: "database-backup",
+    operationKind: "backup",
     acquiredAt: "2026-09-11T11:00:00.000Z",
     ...overrides,
   };
+}
+
+function expectLockErrorCode(fn: () => unknown, code: string): void {
+  try {
+    fn();
+    expect.unreachable(`expected StorageTransactionLockError(${code})`);
+  } catch (error) {
+    expect(error).toBeInstanceOf(StorageTransactionLockError);
+    expect((error as StorageTransactionLockError).code).toBe(code);
+  }
 }
 
 async function waitFor(pathname: string, timeoutMs = 10_000): Promise<void> {
@@ -121,7 +129,7 @@ function spawnLockChild(input: {
   const script = path.join(input.root, `lock-child-${input.name}.mts`);
   fs.writeFileSync(script, `
 import fs from "node:fs";
-import { acquireStorageTransactionLock } from ${JSON.stringify(modulePath)};
+import { acquireStorageTransactionLock, releaseStorageTransactionLock } from ${JSON.stringify(modulePath)};
 const start = ${JSON.stringify(input.start)};
 const acquired = ${JSON.stringify(input.acquired)};
 const release = ${JSON.stringify(input.release)};
@@ -136,11 +144,10 @@ async function waitFor(file) {
 }
 try {
   await waitFor(start);
-  const lock = acquireStorageTransactionLock({ sourceRoot: root });
+  const lock = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
   fs.writeFileSync(acquired, String(process.pid) + "\\n");
   await waitFor(release);
-  lock.markParticipationReady();
-  lock.release();
+  releaseStorageTransactionLock(lock);
   fs.writeFileSync(result, JSON.stringify({ ok: true, pid: process.pid }) + "\\n");
 } catch (error) {
   fs.writeFileSync(result, JSON.stringify({
@@ -157,143 +164,236 @@ try {
   });
 }
 
-describe("storage transaction artifact contract", () => {
-  it("reserves every protocol artifact under one prefix", () => {
-    for (const suffix of [
-      "owner",
-      "owner.tmp.token",
-      "recovery",
-      "quarantine.token",
-      "release.token",
-      "marker",
-      "marker.tmp.token",
-    ]) {
-      expect(isStorageTransactionReservedArtifact(`${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}${suffix}`)).toBe(true);
-    }
-    expect(isStorageTransactionReservedArtifact("paperclip-20260911-120000.sql.gz")).toBe(false);
+describe("paperclip.storage-transaction-lock/v1", () => {
+  it("acquires, holds, and token-safely releases a source-root lock", () => {
+    const root = tempDir("paperclip-tx-lock-basic-");
+    const handle = acquireStorageTransactionLock({
+      sourceRoot: root,
+      operationKind: "backup",
+    });
+
+    expect(handle.token.length).toBeGreaterThanOrEqual(16);
+    expect(fs.existsSync(handle.ownerPath)).toBe(true);
+    expect(path.basename(handle.ownerPath)).toBe(".paperclip-stx-owner");
+    expect(path.basename(handle.participationPath)).toBe(".paperclip-stx-marker");
+    assertStorageTransactionLockHeld(handle);
+
+    const participation = readStorageTransactionParticipation(root);
+    expect(participation?.state).toBe("active");
+    expect(participation?.schema).toBe(STORAGE_TRANSACTION_LOCK_SCHEMA);
+
+    releaseStorageTransactionLock(handle);
+    expect(fs.existsSync(handle.ownerPath)).toBe(false);
+    expect(readStorageTransactionParticipation(root)?.state).toBe("ready");
   });
 
-  it("publishes a complete owner and changes participation from active to ready", () => {
-    const root = tempDir("paperclip-stx-basic-");
-    const current = identity({ pid: 4101, processStartId: "start-4101" });
-    const lock = acquireStorageTransactionLock({ sourceRoot: root, deps: deps(current) });
-
-    expect(lock.record).toMatchObject({
-      schema: STORAGE_TRANSACTION_LOCK_SCHEMA,
-      ...current,
-      token: "token-4101",
-      operationKind: "database-backup",
-    });
-    expect(readStorageTransactionParticipationMarker(root)).toMatchObject({
-      state: "active",
-      token: "token-4101",
+  it("returns busy when a live local owner already holds the lock", () => {
+    const root = tempDir("paperclip-tx-lock-busy-");
+    const first = acquireStorageTransactionLock({
+      sourceRoot: root,
+      operationKind: "backup",
     });
 
-    lock.markParticipationReady();
-    lock.release();
-    expect(fs.existsSync(ownerPath(root))).toBe(false);
-    expect(readStorageTransactionParticipationMarker(root)).toMatchObject({
-      state: "ready",
-      token: "token-4101",
+    try {
+      expect(() =>
+        acquireStorageTransactionLock({
+          sourceRoot: root,
+          operationKind: "raid-archive",
+        }),
+      ).toThrow(StorageTransactionLockError);
+
+      try {
+        acquireStorageTransactionLock({
+          sourceRoot: root,
+          operationKind: "raid-archive",
+        });
+        expect.unreachable("second acquire should fail");
+      } catch (error) {
+        expect(error).toBeInstanceOf(StorageTransactionLockError);
+        expect((error as StorageTransactionLockError).code).toBe("busy");
+      }
+    } finally {
+      releaseStorageTransactionLock(first);
+    }
+  });
+
+  it("emits a clawd-compatible owner and participation fixture shape", () => {
+    const root = tempDir("paperclip-tx-lock-fixture-");
+    const handle = acquireStorageTransactionLock({
+      sourceRoot: root,
+      operationKind: "backup",
     });
+    const raw = JSON.parse(fs.readFileSync(handle.ownerPath, "utf8"));
+    const parsed = parseStorageTransactionOwnerRecord(raw);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.schema).toBe(STORAGE_TRANSACTION_LOCK_SCHEMA);
+    expect(parsed!.token).toBe(handle.token);
+    expect(Object.keys(parsed!).sort()).toEqual([
+      "acquiredAt",
+      "bootId",
+      "machineId",
+      "operationKind",
+      "pid",
+      "processStartId",
+      "schema",
+      "token",
+    ]);
+    expect(Object.keys(readStorageTransactionParticipation(root)!).sort()).toEqual([
+      "schema",
+      "state",
+      "token",
+      "updatedAt",
+    ]);
+    releaseStorageTransactionLock(handle);
+  });
+
+  it("recovers a confirmed dead local owner exactly once under the recovery mutex", () => {
+    const root = tempDir("paperclip-tx-lock-dead-");
+    writeOwner(root, {
+      machineId: readLocalMachineId(),
+      bootId: readLocalBootId(),
+      pid: 2_147_483_646,
+      processStartId: "dead-process-start-id",
+    });
+
+    const recovered = acquireStorageTransactionLock({
+      sourceRoot: root,
+      operationKind: "backup",
+      allowDeadOwnerRecovery: true,
+    });
+    expect(recovered.token).not.toBe("deadtoken0123456789abcdef012345");
+    expect(recovered.owner.bootId).toBe(readLocalBootId());
+    expect(recovered.owner.processStartId).toBe(readProcessStartId());
+    assertStorageTransactionLockHeld(recovered);
+    releaseStorageTransactionLock(recovered);
+  });
+
+  it("refuses a foreign-machine owner without recovery", () => {
+    const root = tempDir("paperclip-tx-lock-foreign-");
+    writeOwner(root, { machineId: "foreign-machine-id-not-local" });
+    try {
+      acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+      expect.unreachable("foreign owner should block");
+    } catch (error) {
+      expect(error).toBeInstanceOf(StorageTransactionLockError);
+      expect((error as StorageTransactionLockError).code).toBe("foreign_owner");
+    }
+  });
+
+  it("refuses to release when the caller token no longer matches", () => {
+    const root = tempDir("paperclip-tx-lock-token-");
+    const first = acquireStorageTransactionLock({
+      sourceRoot: root,
+      operationKind: "backup",
+    });
+    const secondRoot = tempDir("paperclip-tx-lock-token-2-");
+    // Replace owner under recovery by releasing and reacquiring, then forge handle.
+    const handle = acquireStorageTransactionLock({
+      sourceRoot: secondRoot,
+      operationKind: "backup",
+    });
+    const forged = {
+      ...handle,
+      token: "FAKESECRET_g2h3i4j5k6l7m8n9o0p1",
+    };
+    expect(() => releaseStorageTransactionLock(forged)).toThrow(StorageTransactionLockError);
+    releaseStorageTransactionLock(handle);
+    releaseStorageTransactionLock(first);
+  });
+
+  it("excludes reserved protocol artifact names", () => {
+    expect(isStorageTransactionReservedName(STORAGE_TRANSACTION_LOCK_DIR_NAME)).toBe(true);
+    expect(isStorageTransactionReservedName(STORAGE_TRANSACTION_PARTICIPATION_NAME)).toBe(true);
+    expect(isStorageTransactionReservedName(`${STORAGE_TRANSACTION_RESERVED_PREFIX}owner.tmp.x`)).toBe(true);
+    expect(isStorageTransactionReservedName("paperclip-20260911-120000.sql.gz")).toBe(false);
   });
 
   it("never steals a live owner based on age", () => {
-    const root = tempDir("paperclip-stx-live-");
-    writeOwner(root, record({ acquiredAt: "2000-01-01T00:00:00.000Z" }));
+    const root = tempDir("paperclip-tx-lock-live-aged-");
+    const owner = writeOwner(root, {
+      token: "existing-token",
+      pid: process.pid,
+      processStartId: readProcessStartId(),
+      acquiredAt: "2000-01-01T00:00:00.000Z",
+    });
+    const before = fs.readFileSync(path.join(root, STORAGE_TRANSACTION_LOCK_DIR_NAME), "utf8");
 
-    expect(() => acquireStorageTransactionLock({
-      sourceRoot: root,
-      deps: deps(identity({ pid: 4200 }), { checkLiveness: () => ({ status: "alive" }) }),
-    })).toThrow(StorageTransactionBusyError);
-    expect(JSON.parse(fs.readFileSync(ownerPath(root), "utf8")).token).toBe("existing-token");
+    expectLockErrorCode(
+      () => acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" }),
+      "busy",
+    );
+    const after = fs.readFileSync(path.join(root, STORAGE_TRANSACTION_LOCK_DIR_NAME), "utf8");
+    expect(after).toBe(before);
+    expect(JSON.parse(after).token).toBe(owner.token);
   });
 
-  it("recovers one confirmed dead local owner under the recovery mutex", () => {
-    const root = tempDir("paperclip-stx-dead-");
-    writeOwner(root, record({ pid: 1, processStartId: "dead-start" }));
-    const current = identity({ pid: 4201, processStartId: "start-4201" });
-    const lock = acquireStorageTransactionLock({
-      sourceRoot: root,
-      deps: deps(current, {
-        checkLiveness: (observed) => observed.token === "existing-token"
-          ? { status: "dead" }
-          : { status: "alive" },
-      }),
-    });
-    expect(lock.token).toBe("token-4201");
-    expect(JSON.parse(fs.readFileSync(ownerPath(root), "utf8")).token).toBe("token-4201");
-    lock.release();
-  });
+  it("fails closed on malformed owner evidence without replacing it", () => {
+    const cases: Array<[string, string]> = [
+      ["invalid-json", "{not-json\n"],
+      ["wrong-schema", `${JSON.stringify({ ...ownerRecord(), schema: "paperclip.storage-transaction-lock/v0" })}\n`],
+      ["missing-identity", `${JSON.stringify({ ...ownerRecord(), processStartId: "" })}\n`],
+    ];
+    for (const [name, contents] of cases) {
+      const root = tempDir(`paperclip-tx-lock-malformed-${name}-`);
+      const ownerPath = path.join(resolveSourceRootRealPath(root), STORAGE_TRANSACTION_LOCK_DIR_NAME);
+      fs.writeFileSync(ownerPath, contents, { mode: 0o600 });
 
-  it("does not let an old handle remove a replacement owner", () => {
-    const root = tempDir("paperclip-stx-replaced-");
-    const first = acquireStorageTransactionLock({
-      sourceRoot: root,
-      deps: deps(identity({ pid: 4301, processStartId: "first" }), { createToken: () => "first-token" }),
-    });
-    const second = acquireStorageTransactionLock({
-      sourceRoot: root,
-      deps: deps(identity({ pid: 4302, processStartId: "second" }), {
-        createToken: () => "second-token",
-        checkLiveness: (observed) => observed.token === "first-token"
-          ? { status: "dead" }
-          : { status: "alive" },
-      }),
-    });
-
-    first.release();
-    expect(JSON.parse(fs.readFileSync(ownerPath(root), "utf8")).token).toBe("second-token");
-    second.release();
-  });
-
-  it("fails closed for malformed, foreign, EPERM, and unknown owner evidence", () => {
-    for (const status of ["foreign_machine", "eperm", "unreadable"] as const) {
-      const root = tempDir(`paperclip-stx-${status}-`);
-      writeOwner(root, record());
-      expect(() => acquireStorageTransactionLock({
-        sourceRoot: root,
-        deps: deps(identity({ pid: 4400 }), { checkLiveness: () => ({ status }) }),
-      })).toThrow(StorageTransactionBlockedError);
+      expectLockErrorCode(
+        () => acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" }),
+        "malformed",
+      );
+      expect(fs.readFileSync(ownerPath, "utf8")).toBe(contents);
     }
-
-    const malformed = tempDir("paperclip-stx-malformed-");
-    fs.writeFileSync(ownerPath(malformed), "{not-json\n");
-    expect(() => acquireStorageTransactionLock({ sourceRoot: malformed, deps: deps(identity()) }))
-      .toThrow(StorageTransactionBlockedError);
   });
 
   it("treats reboot and PID-reuse evidence as dead", () => {
-    const current = identity({ pid: process.pid, processStartId: "current", bootId: "boot-new" });
-    expect(checkStorageTransactionLiveness(record({
+    const current = {
+      machineId: "machine-a",
+      bootId: "boot-new",
+      pid: process.pid,
+      processStartId: "current",
+    };
+    expect(checkStorageTransactionLiveness(ownerRecord({
       pid: current.pid,
       bootId: current.bootId,
       processStartId: current.processStartId,
-    }), current)).toEqual({ status: "alive" });
-    expect(checkStorageTransactionLiveness(record({ bootId: "boot-old" }), current)).toEqual({ status: "dead" });
-    expect(checkStorageTransactionLiveness(record({ pid: current.pid, bootId: current.bootId }), current))
-      .toEqual({ status: "dead" });
+    }), current)).toBe("alive");
+    expect(checkStorageTransactionLiveness(ownerRecord({ bootId: "boot-old" }), current)).toBe("dead");
+    expect(checkStorageTransactionLiveness(ownerRecord({ pid: current.pid, bootId: current.bootId }), current))
+      .toBe("dead");
+    expect(checkStorageTransactionLiveness(ownerRecord({ machineId: "machine-b" }), current))
+      .toBe("foreign_machine");
   });
 
-  it("ignores an incomplete temp publication and acquires through the canonical hard link", () => {
-    const root = tempDir("paperclip-stx-half-");
-    fs.writeFileSync(
-      path.join(root, `${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}owner.tmp.crashed`),
-      "partial\n",
-    );
-    const lock = acquireStorageTransactionLock({
-      sourceRoot: root,
-      deps: deps(identity({ pid: 4500, processStartId: "start-4500" })),
-    });
-    expect(lock.assertOwned().token).toBe("token-4500");
-    lock.release();
+  it("ignores half-written temp artifacts and acquires through the canonical hard link", () => {
+    const root = tempDir("paperclip-tx-lock-half-");
+    const realRoot = resolveSourceRootRealPath(root);
+    const halfWritten = [
+      path.join(realRoot, `${STORAGE_TRANSACTION_RESERVED_PREFIX}owner.tmp.crashed`),
+      path.join(realRoot, `${STORAGE_TRANSACTION_RESERVED_PREFIX}recovery.tmp.crashed`),
+      path.join(realRoot, `${STORAGE_TRANSACTION_RESERVED_PREFIX}marker.tmp.crashed`),
+    ];
+    for (const filePath of halfWritten) fs.writeFileSync(filePath, "partial\n");
+
+    const handle = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+    try {
+      expect(assertStorageTransactionLockHeld(handle).token).toBe(handle.token);
+      expect(JSON.parse(fs.readFileSync(handle.ownerPath, "utf8")).token).toBe(handle.token);
+      expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "active", token: handle.token });
+      for (const filePath of halfWritten) {
+        expect(fs.readFileSync(filePath, "utf8")).toBe("partial\n");
+      }
+    } finally {
+      releaseStorageTransactionLock(handle);
+    }
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "ready", token: handle.token });
   });
 });
 
 describe("storage transaction cross-process exclusion", () => {
   it("allows exactly one overlapping child into the transaction", async () => {
     expect(fs.existsSync(tsxPath)).toBe(true);
-    const root = tempDir("paperclip-stx-process-");
+    const root = tempDir("paperclip-tx-lock-process-");
     const start = path.join(root, "start.barrier");
     const release = path.join(root, "release.barrier");
     const acquiredA = path.join(root, "acquired-a.barrier");
@@ -311,12 +411,14 @@ describe("storage transaction cross-process exclusion", () => {
 
     const results = [resultA, resultB].map((file) => JSON.parse(fs.readFileSync(file, "utf8")));
     expect(results.filter((result) => result.ok)).toHaveLength(1);
-    expect(results.filter((result) => result.code === "STORAGE_TRANSACTION_BUSY")).toHaveLength(1);
+    expect(results.filter((result) => result.code === "busy")).toHaveLength(1);
+    expect(fs.existsSync(path.join(root, STORAGE_TRANSACTION_LOCK_DIR_NAME))).toBe(false);
+    expect(readStorageTransactionParticipation(root)?.state).toBe("ready");
   }, 30_000);
 
   it("recovers a child owner after abrupt process death", async () => {
     expect(fs.existsSync(tsxPath)).toBe(true);
-    const root = tempDir("paperclip-stx-death-");
+    const root = tempDir("paperclip-tx-lock-death-");
     const start = path.join(root, "start.barrier");
     const acquired = path.join(root, "acquired.barrier");
     const release = path.join(root, "release.barrier");
@@ -326,14 +428,24 @@ describe("storage transaction cross-process exclusion", () => {
     fs.writeFileSync(start, "go\n");
     await waitFor(acquired);
     const ownerPid = Number(fs.readFileSync(acquired, "utf8").trim());
+    const deadToken = JSON.parse(
+      fs.readFileSync(path.join(resolveSourceRootRealPath(root), STORAGE_TRANSACTION_LOCK_DIR_NAME), "utf8"),
+    ).token;
     process.kill(ownerPid, "SIGKILL");
     await waitForPidExit(ownerPid);
     if (child.pid !== ownerPid && child.exitCode == null) child.kill("SIGKILL");
     await childExit(child);
+    expect(readStorageTransactionParticipation(root)?.state).toBe("active");
 
-    const recovered = acquireStorageTransactionLock({ sourceRoot: root });
-    expect(recovered.assertOwned().pid).toBe(process.pid);
-    recovered.markParticipationReady();
-    recovered.release();
+    const recovered = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+    try {
+      expect(recovered.token).not.toBe(deadToken);
+      expect(recovered.recoveries).toHaveLength(1);
+      expect(recovered.recoveries?.[0]).toMatchObject({ classification: "dead_local", recoveredToken: deadToken });
+      expect(assertStorageTransactionLockHeld(recovered).pid).toBe(process.pid);
+    } finally {
+      releaseStorageTransactionLock(recovered);
+    }
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "ready", token: recovered.token });
   }, 30_000);
 });

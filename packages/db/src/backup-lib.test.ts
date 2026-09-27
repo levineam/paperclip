@@ -5,9 +5,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import {
-  StorageTransactionBusyError,
+  STORAGE_TRANSACTION_LOCK_DIR_NAME,
+  STORAGE_TRANSACTION_PARTICIPATION_NAME,
+  StorageTransactionLockError,
   acquireStorageTransactionLock,
-  readStorageTransactionParticipationMarker,
+  assertStorageTransactionLockHeld,
+  releaseStorageTransactionLock,
 } from "./backup-transaction-lock.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
@@ -78,24 +81,24 @@ describe("createBufferedTextFileWriter", () => {
   });
 });
 
-describe("runDatabaseBackup storage transaction", () => {
-  it("fails with a typed busy result before contacting the database", async () => {
-    const backupDir = createTempDir("paperclip-db-backup-busy-");
-    const held = acquireStorageTransactionLock({ sourceRoot: backupDir });
-    try {
-      await expect(runDatabaseBackup({
-        connectionString: "postgres://paperclip:paperclip@127.0.0.1:1/paperclip",
-        backupDir,
-        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
-        backupEngine: "javascript",
-      })).rejects.toBeInstanceOf(StorageTransactionBusyError);
-    } finally {
-      held.release();
-    }
+describe("runDatabaseBackup transaction teardown", () => {
+  it("does not publish an owner when database client setup throws synchronously", async () => {
+    const backupDir = createTempDir("paperclip-db-backup-setup-failure-");
+
+    await expect(runDatabaseBackup({
+      connectionString: "not-a-url",
+      backupDir,
+      retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+      backupEngine: "javascript",
+    })).rejects.toThrow();
+
+    expect(fs.existsSync(path.join(backupDir, STORAGE_TRANSACTION_LOCK_DIR_NAME))).toBe(false);
+    expect(fs.existsSync(path.join(backupDir, STORAGE_TRANSACTION_PARTICIPATION_NAME))).toBe(false);
   });
 
-  it("releases ownership and marks a cleaned failed attempt ready", async () => {
-    const backupDir = createTempDir("paperclip-db-backup-failed-");
+  it("releases an acquired owner when the backup connection fails", async () => {
+    const backupDir = createTempDir("paperclip-db-backup-connection-failure-");
+
     await expect(runDatabaseBackup({
       connectionString: "postgres://paperclip:paperclip@127.0.0.1:1/paperclip",
       backupDir,
@@ -104,9 +107,43 @@ describe("runDatabaseBackup storage transaction", () => {
       connectTimeoutSeconds: 1,
     })).rejects.toThrow();
 
-    expect(readStorageTransactionParticipationMarker(backupDir)).toMatchObject({ state: "ready" });
+    expect(fs.existsSync(path.join(backupDir, STORAGE_TRANSACTION_LOCK_DIR_NAME))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(
+      path.join(backupDir, STORAGE_TRANSACTION_PARTICIPATION_NAME),
+      "utf8",
+    ))).toMatchObject({ state: "ready" });
     expect(fs.readdirSync(backupDir).some((name) => name.endsWith(".sql") || name.endsWith(".sql.gz")))
       .toBe(false);
+  });
+
+  it("fails with a typed busy error without disturbing the held lock or creating artifacts", async () => {
+    const backupDir = createTempDir("paperclip-db-backup-busy-");
+    const held = acquireStorageTransactionLock({ sourceRoot: backupDir, operationKind: "backup" });
+    try {
+      let caught: unknown = null;
+      try {
+        await runDatabaseBackup({
+          connectionString: "postgres://paperclip:paperclip@127.0.0.1:1/paperclip",
+          backupDir,
+          retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+          backupEngine: "javascript",
+          connectTimeoutSeconds: 1,
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(StorageTransactionLockError);
+      expect((caught as StorageTransactionLockError).code).toBe("busy");
+
+      const owner = JSON.parse(fs.readFileSync(held.ownerPath, "utf8"));
+      expect(owner.token).toBe(held.token);
+      expect(assertStorageTransactionLockHeld(held).token).toBe(held.token);
+      expect(fs.readdirSync(backupDir).some((name) => name.endsWith(".sql") || name.endsWith(".sql.gz")))
+        .toBe(false);
+    } finally {
+      releaseStorageTransactionLock(held);
+    }
+    expect(fs.existsSync(held.ownerPath)).toBe(false);
   });
 });
 

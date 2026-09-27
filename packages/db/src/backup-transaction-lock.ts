@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
 import {
   closeSync,
+  existsSync,
   fsyncSync,
   linkSync,
   lstatSync,
@@ -10,283 +10,124 @@ import {
   realpathSync,
   renameSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
-import { execFileSync } from "node:child_process";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { join, resolve, sep } from "node:path";
+import { spawnSync } from "node:child_process";
 
-export const STORAGE_TRANSACTION_LOCK_SCHEMA = "paperclip.storage-transaction-lock/v1" as const;
-export const STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX = ".paperclip-stx-" as const;
+/** Wire schema shared with clawd (byte-compatible; no cross-repo imports). */
+export const STORAGE_TRANSACTION_LOCK_SCHEMA = "paperclip.storage-transaction-lock/v1";
 
-const OWNER_NAME = `${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}owner`;
-const RECOVERY_NAME = `${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}recovery`;
-const MARKER_NAME = `${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}marker`;
+/** Reserved artifact prefix under a locked source root. All enumerators must exclude it. */
+export const STORAGE_TRANSACTION_RESERVED_PREFIX = ".paperclip-stx-";
+export const STORAGE_TRANSACTION_LOCK_DIR_NAME = `${STORAGE_TRANSACTION_RESERVED_PREFIX}owner`;
+export const STORAGE_TRANSACTION_RECOVERY_MUTEX_NAME = `${STORAGE_TRANSACTION_RESERVED_PREFIX}recovery`;
+export const STORAGE_TRANSACTION_PARTICIPATION_NAME = `${STORAGE_TRANSACTION_RESERVED_PREFIX}marker`;
+export const STORAGE_TRANSACTION_TMP_PREFIX = STORAGE_TRANSACTION_RESERVED_PREFIX;
+export const STORAGE_TRANSACTION_QUARANTINE_PREFIX = `${STORAGE_TRANSACTION_RESERVED_PREFIX}quarantine.`;
+
 const MAX_RECORD_BYTES = 64 * 1024;
 
-export type StorageTransactionOperationKind = "database-backup" | string;
+export type StorageTransactionOperationKind =
+  | "backup"
+  | "backup-prune"
+  | "raid-archive"
+  | "storage-transaction-recovery"
+  | "recovery";
 
-export type StorageTransactionIdentity = {
+export type StorageTransactionParticipationState = "active" | "ready";
+
+export type StorageTransactionOwnerRecord = {
+  schema: typeof STORAGE_TRANSACTION_LOCK_SCHEMA;
+  token: string;
   machineId: string;
   bootId: string;
   pid: number;
   processStartId: string;
-};
-
-export type StorageTransactionLockRecord = StorageTransactionIdentity & {
-  schema: typeof STORAGE_TRANSACTION_LOCK_SCHEMA;
-  token: string;
-  operationKind: StorageTransactionOperationKind;
+  operationKind: string;
   acquiredAt: string;
 };
 
-export type StorageTransactionParticipationMarker = {
+export type StorageTransactionParticipationRecord = {
   schema: typeof STORAGE_TRANSACTION_LOCK_SCHEMA;
-  state: "active" | "ready";
+  state: StorageTransactionParticipationState;
   token: string;
   updatedAt: string;
 };
 
-export type StorageTransactionLiveness =
-  | { status: "alive" }
-  | { status: "dead" }
-  | { status: "foreign_machine" }
-  | { status: "eperm" }
-  | { status: "unreadable" };
-
-export type StorageTransactionLockDeps = {
-  resolveIdentity?: () => StorageTransactionIdentity;
-  createToken?: () => string;
-  checkLiveness?: (
-    record: StorageTransactionLockRecord,
-    current: StorageTransactionIdentity,
-  ) => StorageTransactionLiveness;
-  now?: () => Date;
+export type StorageTransactionLockHandle = {
+  sourceRootRealPath: string;
+  ownerPath: string;
+  recoveryMutexPath: string;
+  participationPath: string;
+  token: string;
+  owner: StorageTransactionOwnerRecord;
+  recoveries?: Array<Record<string, unknown>>;
 };
 
 export type AcquireStorageTransactionLockOptions = {
   sourceRoot: string;
-  operationKind?: StorageTransactionOperationKind;
-  maintainParticipationMarker?: boolean;
-  deps?: StorageTransactionLockDeps;
+  operationKind: StorageTransactionOperationKind | string;
+  allowDeadOwnerRecovery?: boolean;
+  nowMs?: number;
 };
 
-export type StorageTransactionLockHandle = {
-  readonly sourceRoot: string;
-  readonly record: StorageTransactionLockRecord;
-  readonly token: string;
-  assertOwned(): StorageTransactionLockRecord;
-  markParticipationReady(): void;
-  release(): void;
-};
+export class StorageTransactionLockError extends Error {
+  readonly code: string;
+  readonly details?: Record<string, unknown>;
 
-export class StorageTransactionBusyError extends Error {
-  readonly code = "STORAGE_TRANSACTION_BUSY" as const;
-
-  constructor(message = "Storage transaction lock is busy") {
+  constructor(code: string, message: string, details?: Record<string, unknown>) {
     super(message);
-    this.name = "StorageTransactionBusyError";
+    this.name = "StorageTransactionLockError";
+    this.code = code;
+    this.details = details;
   }
-}
-
-export class StorageTransactionBlockedError extends Error {
-  readonly code = "STORAGE_TRANSACTION_BLOCKED" as const;
-
-  constructor(
-    readonly reason:
-      | "atomicity_unavailable"
-      | "eperm"
-      | "foreign_machine"
-      | "malformed"
-      | "unreadable",
-    message: string,
-  ) {
-    super(message);
-    this.name = "StorageTransactionBlockedError";
-  }
-}
-
-export class StorageTransactionProtocolFaultError extends Error {
-  readonly code = "STORAGE_TRANSACTION_PROTOCOL_FAULT" as const;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "StorageTransactionProtocolFaultError";
-  }
-}
-
-type LockPaths = {
-  root: string;
-  owner: string;
-  recovery: string;
-  marker: string;
-};
-
-type RequiredDeps = {
-  resolveIdentity: () => StorageTransactionIdentity;
-  createToken: () => string;
-  checkLiveness: (
-    record: StorageTransactionLockRecord,
-    current: StorageTransactionIdentity,
-  ) => StorageTransactionLiveness;
-  now: () => Date;
-};
-
-export function isStorageTransactionReservedArtifact(name: string): boolean {
-  return name.startsWith(STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX);
 }
 
 function isErrno(error: unknown, code: string): boolean {
-  return Boolean(
-    error
-      && typeof error === "object"
-      && "code" in error
-      && (error as NodeJS.ErrnoException).code === code,
-  );
+  return Boolean(error && typeof error === "object" && (error as NodeJS.ErrnoException).code === code);
 }
 
-function canonicalPaths(sourceRoot: string): LockPaths {
-  mkdirSync(sourceRoot, { recursive: true });
-  return pathsForRoot(realpathSync(sourceRoot));
-}
-
-function pathsForRoot(root: string): LockPaths {
-  return {
-    root,
-    owner: join(root, OWNER_NAME),
-    recovery: join(root, RECOVERY_NAME),
-    marker: join(root, MARKER_NAME),
-  };
-}
-
-function safeUnlink(path: string): void {
+function safeUnlink(filePath: string): void {
   try {
-    unlinkSync(path);
+    unlinkSync(filePath);
   } catch (error) {
     if (!isErrno(error, "ENOENT")) throw error;
   }
 }
 
-function readRegularFile(path: string): string | null {
-  let stat;
-  try {
-    stat = lstatSync(path);
-  } catch (error) {
-    if (isErrno(error, "ENOENT")) return null;
-    if (isErrno(error, "EPERM") || isErrno(error, "EACCES")) {
-      throw new StorageTransactionBlockedError("eperm", `Cannot inspect storage transaction artifact: ${path}`);
-    }
-    throw new StorageTransactionBlockedError("unreadable", `Cannot inspect storage transaction artifact: ${path}`);
-  }
-  if (!stat.isFile() || stat.size <= 0 || stat.size > MAX_RECORD_BYTES) {
-    throw new StorageTransactionBlockedError("malformed", `Storage transaction artifact is not a bounded regular file: ${path}`);
-  }
-  try {
-    return readFileSync(path, "utf8");
-  } catch (error) {
-    if (isErrno(error, "EPERM") || isErrno(error, "EACCES")) {
-      throw new StorageTransactionBlockedError("eperm", `Cannot read storage transaction artifact: ${path}`);
-    }
-    throw new StorageTransactionBlockedError("unreadable", `Cannot read storage transaction artifact: ${path}`);
-  }
+function shellText(command: string, args: string[]): string | null {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout: 2_000,
+    stdio: ["ignore", "pipe", "ignore"],
+    env: process.env,
+  });
+  if (result.status !== 0) return null;
+  const out = String(result.stdout ?? "").trim();
+  return out.length > 0 ? out : null;
 }
 
-function parseRecord(raw: string, path: string): StorageTransactionLockRecord {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new StorageTransactionBlockedError("malformed", `Storage transaction record is invalid JSON: ${path}`);
-  }
-  if (!value || typeof value !== "object") {
-    throw new StorageTransactionBlockedError("malformed", `Storage transaction record is malformed: ${path}`);
-  }
-  const record = value as Record<string, unknown>;
-  const valid = record.schema === STORAGE_TRANSACTION_LOCK_SCHEMA
-    && typeof record.machineId === "string" && record.machineId.length > 0
-    && typeof record.bootId === "string" && record.bootId.length > 0
-    && typeof record.pid === "number" && Number.isSafeInteger(record.pid) && record.pid > 0
-    && typeof record.processStartId === "string" && record.processStartId.length > 0
-    && typeof record.token === "string" && record.token.length > 0
-    && typeof record.operationKind === "string" && record.operationKind.length > 0
-    && typeof record.acquiredAt === "string" && Number.isFinite(Date.parse(record.acquiredAt));
-  if (!valid) {
-    throw new StorageTransactionBlockedError("malformed", `Storage transaction record is malformed: ${path}`);
-  }
-  return record as StorageTransactionLockRecord;
-}
-
-function readRecord(path: string): StorageTransactionLockRecord | null {
-  const raw = readRegularFile(path);
-  return raw == null ? null : parseRecord(raw, path);
-}
-
-function writeTempRecord(root: string, role: "owner" | "recovery", record: StorageTransactionLockRecord): string {
-  const path = join(root, `${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}${role}.tmp.${record.token}.${randomUUID()}`);
-  const fd = openSync(path, "wx", 0o600);
-  try {
-    writeSync(fd, `${JSON.stringify(record)}\n`, undefined, "utf8");
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  return path;
-}
-
-function publishHardLink(temp: string, canonical: string): void {
-  try {
-    linkSync(temp, canonical);
-  } catch (error) {
-    if (isErrno(error, "EEXIST")) throw error;
-    if (
-      isErrno(error, "EXDEV")
-      || isErrno(error, "EPERM")
-      || isErrno(error, "ENOTSUP")
-      || isErrno(error, "EOPNOTSUPP")
-    ) {
-      throw new StorageTransactionBlockedError(
-        "atomicity_unavailable",
-        "This filesystem cannot publish the storage transaction lock atomically",
-      );
-    }
-    throw error;
-  }
-
-  const sourceStat = lstatSync(temp);
-  const canonicalStat = lstatSync(canonical);
-  if (
-    !sourceStat.isFile()
-    || !canonicalStat.isFile()
-    || sourceStat.dev !== canonicalStat.dev
-    || sourceStat.ino !== canonicalStat.ino
-  ) {
-    throw new StorageTransactionProtocolFaultError("Published lock is not the expected hard-linked record");
-  }
-}
-
-function machineId(): string | null {
+export function readLocalMachineId(): string | null {
   for (const candidate of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
     try {
       const value = readFileSync(candidate, "utf8").trim();
       if (value) return value;
     } catch {
-      // Try the next platform source.
+      // try next
     }
   }
   if (process.platform === "darwin") {
-    try {
-      const output = execFileSync("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      return output.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/)?.[1] ?? null;
-    } catch {
-      return null;
-    }
+    const output = shellText("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
+    const matched = output && output.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
+    if (matched) return matched[1]!;
   }
   return null;
 }
 
-function bootId(): string | null {
+export function readLocalBootId(): string | null {
   if (process.platform === "linux") {
     try {
       return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() || null;
@@ -294,20 +135,11 @@ function bootId(): string | null {
       return null;
     }
   }
-  if (process.platform === "darwin") {
-    try {
-      return execFileSync("sysctl", ["-n", "kern.boottime"], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim() || null;
-    } catch {
-      return null;
-    }
-  }
+  if (process.platform === "darwin") return shellText("sysctl", ["-n", "kern.boottime"]);
   return null;
 }
 
-function processStartId(pid: number): string | null {
+export function readProcessStartId(pid: number = process.pid): string | null {
   if (process.platform === "linux") {
     try {
       const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -318,135 +150,279 @@ function processStartId(pid: number): string | null {
       return null;
     }
   }
-  if (process.platform === "darwin") {
-    try {
-      return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      }).trim() || null;
-    } catch {
-      return null;
-    }
-  }
+  if (process.platform === "darwin") return shellText("ps", ["-p", String(pid), "-o", "lstart="]);
   return null;
 }
 
-export function resolveStorageTransactionIdentity(): StorageTransactionIdentity {
-  const resolvedMachineId = machineId();
-  const resolvedBootId = bootId();
-  const resolvedProcessStartId = processStartId(process.pid);
-  if (!resolvedMachineId || !resolvedBootId || !resolvedProcessStartId) {
-    throw new StorageTransactionBlockedError(
+export function resolveStorageTransactionIdentity(): {
+  machineId: string;
+  bootId: string;
+  pid: number;
+  processStartId: string;
+} {
+  const machineId = readLocalMachineId();
+  const bootId = readLocalBootId();
+  const processStartId = readProcessStartId();
+  if (!machineId || !bootId || !processStartId) {
+    throw new StorageTransactionLockError(
       "unreadable",
       "Cannot establish stable machine, boot, and process-start identity",
     );
   }
+  return { machineId, bootId, pid: process.pid, processStartId };
+}
+
+export function resolveSourceRootRealPath(
+  sourceRoot: string,
+  options: { createIfMissing?: boolean } = {},
+): string {
+  const createIfMissing = options.createIfMissing !== false;
+  const resolved = resolve(sourceRoot);
+  if (createIfMissing) mkdirSync(resolved, { recursive: true });
+  try {
+    return realpathSync(resolved);
+  } catch (error) {
+    if (!createIfMissing && isErrno(error, "ENOENT")) return resolved;
+    throw error;
+  }
+}
+
+function ownerPaths(sourceRootRealPath: string) {
   return {
-    machineId: resolvedMachineId,
-    bootId: resolvedBootId,
-    pid: process.pid,
-    processStartId: resolvedProcessStartId,
+    sourceRootRealPath,
+    ownerPath: join(sourceRootRealPath, STORAGE_TRANSACTION_LOCK_DIR_NAME),
+    recoveryMutexPath: join(sourceRootRealPath, STORAGE_TRANSACTION_RECOVERY_MUTEX_NAME),
+    participationPath: join(sourceRootRealPath, STORAGE_TRANSACTION_PARTICIPATION_NAME),
   };
 }
 
+function readRegularFile(filePath: string): string | null {
+  let stat;
+  try {
+    stat = lstatSync(filePath);
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return null;
+    if (isErrno(error, "EPERM") || isErrno(error, "EACCES")) {
+      throw new StorageTransactionLockError("eperm", "Cannot inspect storage transaction artifact", { filePath });
+    }
+    throw new StorageTransactionLockError("unreadable", "Cannot inspect storage transaction artifact", { filePath });
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > MAX_RECORD_BYTES) {
+    throw new StorageTransactionLockError(
+      "malformed",
+      "Storage transaction artifact is not a bounded regular file",
+      { filePath },
+    );
+  }
+  try {
+    return readFileSync(filePath, "utf8");
+  } catch (error) {
+    if (isErrno(error, "EPERM") || isErrno(error, "EACCES")) {
+      throw new StorageTransactionLockError("eperm", "Cannot read storage transaction artifact", { filePath });
+    }
+    throw new StorageTransactionLockError("unreadable", "Cannot read storage transaction artifact", { filePath });
+  }
+}
+
+export function parseStorageTransactionOwnerRecord(
+  value: unknown,
+): StorageTransactionOwnerRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  const valid = v.schema === STORAGE_TRANSACTION_LOCK_SCHEMA
+    && typeof v.machineId === "string" && v.machineId.length > 0
+    && typeof v.bootId === "string" && v.bootId.length > 0
+    && Number.isSafeInteger(v.pid) && (v.pid as number) > 0
+    && typeof v.processStartId === "string" && v.processStartId.length > 0
+    && typeof v.token === "string" && v.token.length > 0
+    && typeof v.operationKind === "string" && v.operationKind.length > 0
+    && typeof v.acquiredAt === "string" && Number.isFinite(Date.parse(v.acquiredAt));
+  return valid ? (value as StorageTransactionOwnerRecord) : null;
+}
+
+export function parseStorageTransactionParticipationRecord(
+  value: unknown,
+): StorageTransactionParticipationRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  const valid = v.schema === STORAGE_TRANSACTION_LOCK_SCHEMA
+    && (v.state === "active" || v.state === "ready")
+    && typeof v.token === "string" && v.token.length > 0
+    && typeof v.updatedAt === "string" && Number.isFinite(Date.parse(v.updatedAt));
+  return valid ? (value as StorageTransactionParticipationRecord) : null;
+}
+
+function parseJson(raw: string, filePath: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new StorageTransactionLockError("malformed", "Storage transaction artifact is invalid JSON", { filePath });
+  }
+}
+
+function readOwnerRecord(filePath: string): StorageTransactionOwnerRecord | null {
+  const raw = readRegularFile(filePath);
+  if (raw == null) return null;
+  const parsed = parseStorageTransactionOwnerRecord(parseJson(raw, filePath));
+  if (!parsed) {
+    throw new StorageTransactionLockError("malformed", "Storage transaction owner record is malformed", { filePath });
+  }
+  return parsed;
+}
+
+function readParticipationRecord(filePath: string): StorageTransactionParticipationRecord | null {
+  const raw = readRegularFile(filePath);
+  if (raw == null) return null;
+  const parsed = parseStorageTransactionParticipationRecord(parseJson(raw, filePath));
+  if (!parsed) {
+    throw new StorageTransactionLockError(
+      "malformed",
+      "Storage transaction participation marker is malformed",
+      { filePath },
+    );
+  }
+  return parsed;
+}
+
 export function checkStorageTransactionLiveness(
-  record: StorageTransactionLockRecord,
-  current: StorageTransactionIdentity,
-): StorageTransactionLiveness {
-  if (record.machineId !== current.machineId) return { status: "foreign_machine" };
-  if (record.bootId !== current.bootId) return { status: "dead" };
+  record: StorageTransactionOwnerRecord,
+  current: { machineId: string; bootId: string; pid: number; processStartId: string },
+): "alive" | "dead" | "foreign_machine" | "eperm" | "unreadable" {
+  if (record.machineId !== current.machineId) return "foreign_machine";
+  if (record.bootId !== current.bootId) return "dead";
   if (record.pid === current.pid) {
-    return record.processStartId === current.processStartId ? { status: "alive" } : { status: "dead" };
+    return record.processStartId === current.processStartId ? "alive" : "dead";
   }
   try {
     process.kill(record.pid, 0);
   } catch (error) {
-    if (isErrno(error, "ESRCH")) return { status: "dead" };
-    if (isErrno(error, "EPERM")) return { status: "eperm" };
-    return { status: "unreadable" };
+    if (isErrno(error, "ESRCH")) return "dead";
+    if (isErrno(error, "EPERM")) return "eperm";
+    return "unreadable";
   }
-  const observedStart = processStartId(record.pid);
-  if (!observedStart) return { status: "unreadable" };
-  return observedStart === record.processStartId ? { status: "alive" } : { status: "dead" };
+  const observedStart = readProcessStartId(record.pid);
+  if (!observedStart) return "unreadable";
+  return observedStart === record.processStartId ? "alive" : "dead";
 }
 
 function classifyExisting(
-  record: StorageTransactionLockRecord,
-  identity: StorageTransactionIdentity,
-  checkLiveness: RequiredDeps["checkLiveness"],
+  record: StorageTransactionOwnerRecord,
+  identity: { machineId: string; bootId: string; pid: number; processStartId: string },
 ): "dead" {
-  const liveness = checkLiveness(record, identity);
-  if (liveness.status === "dead") return "dead";
-  if (liveness.status === "alive") {
-    throw new StorageTransactionBusyError(`Storage transaction lock is held by pid ${record.pid}`);
+  const status = checkStorageTransactionLiveness(record, identity);
+  if (status === "dead") return "dead";
+  if (status === "alive") {
+    throw new StorageTransactionLockError("busy", "Storage transaction lock is held by a live process", {
+      holderPid: record.pid,
+    });
   }
-  if (liveness.status === "foreign_machine") {
-    throw new StorageTransactionBlockedError("foreign_machine", "Storage transaction lock belongs to another machine");
+  if (status === "foreign_machine") {
+    throw new StorageTransactionLockError("foreign_owner", "Storage transaction lock belongs to another machine");
   }
-  if (liveness.status === "eperm") {
-    throw new StorageTransactionBlockedError("eperm", "Storage transaction owner liveness is permission-denied");
+  if (status === "eperm") {
+    throw new StorageTransactionLockError("eperm", "Storage transaction owner liveness is permission-denied");
   }
-  throw new StorageTransactionBlockedError("unreadable", "Storage transaction owner liveness is unknown");
+  throw new StorageTransactionLockError("unreadable", "Storage transaction owner liveness is unknown");
 }
 
 function newRecord(
-  identity: StorageTransactionIdentity,
+  identity: { machineId: string; bootId: string; pid: number; processStartId: string },
   token: string,
   operationKind: string,
-  now: Date,
-): StorageTransactionLockRecord {
+  nowMs: number,
+): StorageTransactionOwnerRecord {
   return {
     schema: STORAGE_TRANSACTION_LOCK_SCHEMA,
     ...identity,
     token,
     operationKind,
-    acquiredAt: now.toISOString(),
+    acquiredAt: new Date(nowMs).toISOString(),
   };
 }
 
-function retireRecord(path: string, root: string, role: "quarantine" | "release", expectedToken: string): string {
-  const retired = join(root, `${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}${role}.${expectedToken}.${randomUUID()}`);
+function writeTempRecord(root: string, role: string, record: StorageTransactionOwnerRecord): string {
+  const filePath = join(root, `${STORAGE_TRANSACTION_RESERVED_PREFIX}${role}.tmp.${record.token}.${randomUUID()}`);
+  const fd = openSync(filePath, "wx", 0o600);
   try {
-    renameSync(path, retired);
+    writeSync(fd, `${JSON.stringify(record)}\n`, undefined, "utf8");
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  return filePath;
+}
+
+function publishHardLink(tempPath: string, canonicalPath: string): void {
+  try {
+    linkSync(tempPath, canonicalPath);
   } catch (error) {
-    if (isErrno(error, "ENOENT")) {
-      throw new StorageTransactionBusyError("Storage transaction ownership changed during recovery");
+    if (isErrno(error, "EEXIST")) throw error;
+    if (["EXDEV", "EPERM", "ENOTSUP", "EOPNOTSUPP"].some((code) => isErrno(error, code))) {
+      throw new StorageTransactionLockError(
+        "unsupported_filesystem",
+        "Filesystem cannot publish the storage transaction lock atomically",
+      );
     }
     throw error;
   }
-  const moved = readRecord(retired);
+  const source = lstatSync(tempPath);
+  const canonical = lstatSync(canonicalPath);
+  if (!source.isFile() || !canonical.isFile() || source.dev !== canonical.dev || source.ino !== canonical.ino) {
+    throw new StorageTransactionLockError("protocol_fault", "Published lock is not the expected hard-linked record");
+  }
+}
+
+function retireRecord(
+  filePath: string,
+  root: string,
+  role: string,
+  expectedToken: string,
+): string {
+  const retired = join(root, `${STORAGE_TRANSACTION_RESERVED_PREFIX}${role}.${expectedToken}.${randomUUID()}`);
+  try {
+    renameSync(filePath, retired);
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      throw new StorageTransactionLockError("busy", "Storage transaction ownership changed");
+    }
+    throw error;
+  }
+  const moved = readOwnerRecord(retired);
   if (!moved || moved.token !== expectedToken) {
-    throw new StorageTransactionProtocolFaultError(`Retired ${role} record token does not match the observed owner`);
+    throw new StorageTransactionLockError(
+      "protocol_fault",
+      `Retired ${role} record token does not match the observed owner`,
+    );
   }
   return retired;
 }
 
-function acquireMutex(
-  paths: LockPaths,
-  identity: StorageTransactionIdentity,
+function acquireRecoveryMutex(
+  paths: ReturnType<typeof ownerPaths>,
+  identity: { machineId: string; bootId: string; pid: number; processStartId: string },
   token: string,
-  deps: RequiredDeps,
-): { release(): void } {
-  const record = newRecord(identity, token, "storage-transaction-recovery", deps.now());
-  const temp = writeTempRecord(paths.root, "recovery", record);
+  nowMs: number,
+): { release: () => void } {
+  const record = newRecord(identity, token, "storage-transaction-recovery", nowMs);
+  const temp = writeTempRecord(paths.sourceRootRealPath, "recovery", record);
   try {
     try {
-      publishHardLink(temp, paths.recovery);
+      publishHardLink(temp, paths.recoveryMutexPath);
     } catch (error) {
       if (!isErrno(error, "EEXIST")) throw error;
-      const existing = readRecord(paths.recovery);
-      if (!existing) throw new StorageTransactionBusyError("Storage transaction recovery ownership changed");
-      classifyExisting(existing, identity, deps.checkLiveness);
-      const reread = readRecord(paths.recovery);
-      if (!reread) throw new StorageTransactionBusyError("Storage transaction recovery ownership changed");
-      classifyExisting(reread, identity, deps.checkLiveness);
-      const quarantined = retireRecord(paths.recovery, paths.root, "quarantine", reread.token);
+      const existing = readOwnerRecord(paths.recoveryMutexPath);
+      if (!existing) throw new StorageTransactionLockError("recovery_conflict", "Storage transaction recovery ownership changed");
+      classifyExisting(existing, identity);
+      const reread = readOwnerRecord(paths.recoveryMutexPath);
+      if (!reread) throw new StorageTransactionLockError("recovery_conflict", "Storage transaction recovery ownership changed");
+      classifyExisting(reread, identity);
+      const quarantined = retireRecord(paths.recoveryMutexPath, paths.sourceRootRealPath, "quarantine", reread.token);
       safeUnlink(quarantined);
       try {
-        publishHardLink(temp, paths.recovery);
+        publishHardLink(temp, paths.recoveryMutexPath);
       } catch (publishError) {
         if (isErrno(publishError, "EEXIST")) {
-          throw new StorageTransactionBusyError("Storage transaction recovery mutex is busy");
+          throw new StorageTransactionLockError("recovery_conflict", "Storage transaction recovery mutex is busy");
         }
         throw publishError;
       }
@@ -454,19 +430,24 @@ function acquireMutex(
   } finally {
     safeUnlink(temp);
   }
-
   return {
     release() {
-      const existing = readRecord(paths.recovery);
+      const existing = readOwnerRecord(paths.recoveryMutexPath);
       if (!existing || existing.token !== token) return;
-      const retired = retireRecord(paths.recovery, paths.root, "release", token);
+      const retired = retireRecord(paths.recoveryMutexPath, paths.sourceRootRealPath, "release", token);
       safeUnlink(retired);
     },
   };
 }
 
-function writeMarker(paths: LockPaths, marker: StorageTransactionParticipationMarker): void {
-  const temp = join(paths.root, `${STORAGE_TRANSACTION_LOCK_ARTIFACT_PREFIX}marker.tmp.${marker.token}.${randomUUID()}`);
+function writeParticipation(
+  paths: ReturnType<typeof ownerPaths>,
+  marker: StorageTransactionParticipationRecord,
+): void {
+  const temp = join(
+    paths.sourceRootRealPath,
+    `${STORAGE_TRANSACTION_RESERVED_PREFIX}marker.tmp.${marker.token}.${randomUUID()}`,
+  );
   const fd = openSync(temp, "wx", 0o600);
   try {
     writeSync(fd, `${JSON.stringify(marker)}\n`, undefined, "utf8");
@@ -475,160 +456,224 @@ function writeMarker(paths: LockPaths, marker: StorageTransactionParticipationMa
     closeSync(fd);
   }
   try {
-    renameSync(temp, paths.marker);
+    renameSync(temp, paths.participationPath);
   } catch (error) {
     safeUnlink(temp);
     throw error;
   }
 }
 
-export function readStorageTransactionParticipationMarker(
-  sourceRoot: string,
-): StorageTransactionParticipationMarker | null {
-  let paths: LockPaths;
-  try {
-    paths = pathsForRoot(realpathSync(sourceRoot));
-  } catch (error) {
-    if (isErrno(error, "ENOENT")) return null;
-    throw error;
-  }
-  const raw = readRegularFile(paths.marker);
-  if (raw == null) return null;
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!value || typeof value !== "object") return null;
-  const marker = value as Record<string, unknown>;
-  if (
-    marker.schema !== STORAGE_TRANSACTION_LOCK_SCHEMA
-    || (marker.state !== "active" && marker.state !== "ready")
-    || typeof marker.token !== "string" || marker.token.length === 0
-    || typeof marker.updatedAt !== "string" || !Number.isFinite(Date.parse(marker.updatedAt))
-  ) return null;
-  return marker as StorageTransactionParticipationMarker;
-}
-
-function publishOwner(
-  paths: LockPaths,
-  record: StorageTransactionLockRecord,
-  maintainMarker: boolean,
-  deps: RequiredDeps,
-): StorageTransactionLockHandle {
-  const temp = writeTempRecord(paths.root, "owner", record);
-  try {
-    publishHardLink(temp, paths.owner);
-  } finally {
-    safeUnlink(temp);
-  }
-
-  const createHandle = (): StorageTransactionLockHandle => {
-    let released = false;
-    return {
-      sourceRoot: paths.root,
-      record,
-      token: record.token,
-      assertOwned() {
-        if (released) throw new StorageTransactionProtocolFaultError("Storage transaction handle is released");
-        const current = readRecord(paths.owner);
-        if (!current || current.token !== record.token) {
-          throw new StorageTransactionProtocolFaultError("Storage transaction ownership no longer matches this handle");
-        }
-        return current;
-      },
-      markParticipationReady() {
-        if (!maintainMarker) return;
-        this.assertOwned();
-        writeMarker(paths, {
-          schema: STORAGE_TRANSACTION_LOCK_SCHEMA,
-          state: "ready",
-          token: record.token,
-          updatedAt: deps.now().toISOString(),
-        });
-      },
-      release() {
-        if (released) return;
-        const releaseToken = randomUUID();
-        const recovery = acquireMutex(paths, deps.resolveIdentity(), releaseToken, deps);
-        try {
-          const current = readRecord(paths.owner);
-          if (current && current.token === record.token) {
-            const retired = retireRecord(paths.owner, paths.root, "release", record.token);
-            safeUnlink(retired);
-          }
-          released = true;
-        } finally {
-          recovery.release();
-        }
-      },
-    };
-  };
-
-  const handle = createHandle();
-  if (maintainMarker) {
-    try {
-      writeMarker(paths, {
-        schema: STORAGE_TRANSACTION_LOCK_SCHEMA,
-        state: "active",
-        token: record.token,
-        updatedAt: deps.now().toISOString(),
-      });
-    } catch (error) {
-      handle.release();
-      throw error;
-    }
-  }
-  return handle;
-}
-
-function defaultDeps(overrides?: StorageTransactionLockDeps): RequiredDeps {
+function markerFor(
+  state: StorageTransactionParticipationState,
+  token: string,
+  nowMs: number,
+): StorageTransactionParticipationRecord {
   return {
-    resolveIdentity: overrides?.resolveIdentity ?? resolveStorageTransactionIdentity,
-    createToken: overrides?.createToken ?? randomUUID,
-    checkLiveness: overrides?.checkLiveness ?? checkStorageTransactionLiveness,
-    now: overrides?.now ?? (() => new Date()),
+    schema: STORAGE_TRANSACTION_LOCK_SCHEMA,
+    state,
+    token,
+    updatedAt: new Date(nowMs).toISOString(),
   };
 }
 
+export function isStorageTransactionReservedName(name: string): boolean {
+  return typeof name === "string" && name.startsWith(STORAGE_TRANSACTION_RESERVED_PREFIX);
+}
+
+export function isStorageTransactionReservedPath(filePath: string, sourceRoot: string): boolean {
+  const root = resolveSourceRootRealPath(sourceRoot, { createIfMissing: false });
+  const resolved = resolve(filePath);
+  const rel = resolved.startsWith(root + sep)
+    ? resolved.slice(root.length + 1)
+    : resolved === root
+      ? ""
+      : null;
+  if (rel == null) return false;
+  const top = rel.split(sep)[0] ?? "";
+  return isStorageTransactionReservedName(top);
+}
+
+/**
+ * Acquire the source-root storage transaction lock.
+ * Publishes a fully populated owner record via same-directory hardlink and holds
+ * it for the entire producer/archive transaction.
+ */
 export function acquireStorageTransactionLock(
   options: AcquireStorageTransactionLockOptions,
 ): StorageTransactionLockHandle {
-  const paths = canonicalPaths(options.sourceRoot);
-  const deps = defaultDeps(options.deps);
-  const identity = deps.resolveIdentity();
-  const token = deps.createToken();
-  const record = newRecord(identity, token, options.operationKind ?? "database-backup", deps.now());
-  const maintainMarker = options.maintainParticipationMarker ?? true;
+  const sourceRootRealPath = resolveSourceRootRealPath(options.sourceRoot);
+  const paths = ownerPaths(sourceRootRealPath);
+  const identity = resolveStorageTransactionIdentity();
+  const nowMs = options.nowMs ?? Date.now();
+  const token = randomUUID();
+  const owner = newRecord(identity, token, options.operationKind || "backup", nowMs);
+  const recoveries: Array<Record<string, unknown>> = [];
+
+  const publishOwner = (): StorageTransactionLockHandle => {
+    const temp = writeTempRecord(sourceRootRealPath, "owner", owner);
+    try {
+      publishHardLink(temp, paths.ownerPath);
+    } finally {
+      safeUnlink(temp);
+    }
+    try {
+      writeParticipation(paths, markerFor("active", token, nowMs));
+    } catch (error) {
+      const recovery = acquireRecoveryMutex(paths, identity, randomUUID(), Date.now());
+      try {
+        const current = readOwnerRecord(paths.ownerPath);
+        if (current && current.token === token) {
+          const retired = retireRecord(paths.ownerPath, sourceRootRealPath, "release", token);
+          safeUnlink(retired);
+        }
+      } finally {
+        recovery.release();
+      }
+      throw error;
+    }
+    return {
+      sourceRootRealPath,
+      ownerPath: paths.ownerPath,
+      recoveryMutexPath: paths.recoveryMutexPath,
+      participationPath: paths.participationPath,
+      token,
+      owner,
+      recoveries,
+    };
+  };
 
   try {
-    return publishOwner(paths, record, maintainMarker, deps);
+    return publishOwner();
   } catch (error) {
     if (!isErrno(error, "EEXIST")) throw error;
   }
 
-  const existing = readRecord(paths.owner);
-  if (!existing) throw new StorageTransactionBusyError("Storage transaction ownership changed; retry from fresh state");
-  classifyExisting(existing, identity, deps.checkLiveness);
+  const existing = readOwnerRecord(paths.ownerPath);
+  if (!existing) {
+    throw new StorageTransactionLockError("busy", "Storage transaction ownership changed; retry from fresh state");
+  }
+  classifyExisting(existing, identity);
+  if (options.allowDeadOwnerRecovery === false) {
+    throw new StorageTransactionLockError("busy", "Dead-owner recovery is disabled");
+  }
 
-  const recovery = acquireMutex(paths, identity, token, deps);
+  const recovery = acquireRecoveryMutex(paths, identity, token, nowMs);
   try {
-    const reread = readRecord(paths.owner);
+    const reread = readOwnerRecord(paths.ownerPath);
     if (reread) {
-      classifyExisting(reread, identity, deps.checkLiveness);
-      const quarantined = retireRecord(paths.owner, paths.root, "quarantine", reread.token);
+      classifyExisting(reread, identity);
+      const quarantined = retireRecord(paths.ownerPath, sourceRootRealPath, "quarantine", reread.token);
+      recoveries.push({
+        sourceRootRealPath,
+        classification: "dead_local",
+        quarantined: true,
+        quarantinePath: quarantined,
+        recoveredToken: reread.token,
+      });
       safeUnlink(quarantined);
     }
     try {
-      return publishOwner(paths, record, maintainMarker, deps);
+      return publishOwner();
     } catch (error) {
       if (isErrno(error, "EEXIST")) {
-        throw new StorageTransactionBusyError("Storage transaction lock was acquired by another owner");
+        throw new StorageTransactionLockError("busy", "Storage transaction lock was acquired by another owner");
       }
       throw error;
     }
   } finally {
     recovery.release();
   }
+}
+
+export function assertStorageTransactionLockHeld(handle: StorageTransactionLockHandle): StorageTransactionOwnerRecord {
+  const current = readOwnerRecord(handle.ownerPath);
+  if (!current || current.token !== handle.token) {
+    throw new StorageTransactionLockError(
+      "token_mismatch",
+      "Storage transaction ownership no longer matches this handle",
+      { sourceRootRealPath: handle.sourceRootRealPath },
+    );
+  }
+  if (current.pid !== process.pid || current.processStartId !== readProcessStartId()) {
+    throw new StorageTransactionLockError(
+      "not_holder",
+      "Storage transaction owner identity no longer matches this process",
+      { sourceRootRealPath: handle.sourceRootRealPath },
+    );
+  }
+  return current;
+}
+
+export function markStorageTransactionParticipationReady(
+  handle: StorageTransactionLockHandle,
+  nowMs: number = Date.now(),
+): void {
+  assertStorageTransactionLockHeld(handle);
+  writeParticipation(ownerPaths(handle.sourceRootRealPath), markerFor("ready", handle.token, nowMs));
+}
+
+/**
+ * Token-safe release: removes only this holder's owner record and leaves a
+ * ready participation marker for enrolled archive consumers.
+ */
+export function releaseStorageTransactionLock(
+  handle: StorageTransactionLockHandle,
+  options: { participationState?: StorageTransactionParticipationState } = {},
+): void {
+  const identity = resolveStorageTransactionIdentity();
+  const paths = ownerPaths(handle.sourceRootRealPath);
+  const recovery = acquireRecoveryMutex(paths, identity, randomUUID(), Date.now());
+  try {
+    const current = readOwnerRecord(paths.ownerPath);
+    if (!current) return;
+    if (current.token !== handle.token) {
+      throw new StorageTransactionLockError(
+        "token_mismatch",
+        "Refusing to release a replacement storage transaction owner",
+        { sourceRootRealPath: handle.sourceRootRealPath },
+      );
+    }
+    if ((options.participationState || "ready") === "ready") {
+      writeParticipation(paths, markerFor("ready", handle.token, Date.now()));
+    }
+    const retired = retireRecord(paths.ownerPath, paths.sourceRootRealPath, "release", handle.token);
+    safeUnlink(retired);
+  } finally {
+    recovery.release();
+  }
+}
+
+export function readStorageTransactionParticipation(
+  sourceRoot: string,
+  options: { createIfMissing?: boolean } = {},
+): StorageTransactionParticipationRecord | null {
+  const sourceRootRealPath = resolveSourceRootRealPath(sourceRoot, {
+    createIfMissing: options.createIfMissing === true,
+  });
+  try {
+    return readParticipationRecord(ownerPaths(sourceRootRealPath).participationPath);
+  } catch {
+    return null;
+  }
+}
+
+export function classifyPaperclipParticipation(sourceRoot: string): {
+  ok: boolean;
+  reason: string | null;
+  sourceRootRealPath: string;
+  record?: StorageTransactionParticipationRecord | null;
+  newestSourceMtimeMs?: number | null;
+} {
+  const sourceRootRealPath = resolveSourceRootRealPath(sourceRoot, { createIfMissing: false });
+  let record: StorageTransactionParticipationRecord | null = null;
+  try {
+    record = readParticipationRecord(ownerPaths(sourceRootRealPath).participationPath);
+  } catch {
+    return { ok: false, reason: "participation_incompatible", sourceRootRealPath };
+  }
+  if (!record) return { ok: false, reason: "participation_missing", sourceRootRealPath };
+  if (record.state === "active") {
+    return { ok: false, reason: "participation_active", sourceRootRealPath, record };
+  }
+  return { ok: true, reason: null, sourceRootRealPath, record };
 }

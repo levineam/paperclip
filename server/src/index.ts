@@ -24,7 +24,7 @@ import {
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
-  StorageTransactionBusyError,
+  StorageTransactionLockError,
   authUsers,
   companies,
   companyMemberships,
@@ -636,10 +636,10 @@ export async function startServer(): Promise<StartedServer> {
       );
       return response;
     } catch (err) {
-      if (err instanceof StorageTransactionBusyError) {
+      if (err instanceof StorageTransactionLockError && err.code === "busy") {
         if (trigger === "scheduled") {
           logger.warn(
-            { backupDir: config.databaseBackupDir, trigger },
+            { backupDir: config.databaseBackupDir, trigger, reason: err.code },
             "Skipping scheduled database backup because the storage transaction lock is busy",
           );
           return null;
