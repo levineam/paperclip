@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
 import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import {
@@ -114,6 +114,43 @@ describe("runDatabaseBackup transaction teardown", () => {
     ))).toMatchObject({ state: "ready" });
     expect(fs.readdirSync(backupDir).some((name) => name.endsWith(".sql") || name.endsWith(".sql.gz")))
       .toBe(false);
+  });
+
+  it("keeps the active marker and aggregates the cleanup failure when a partial artifact survives", async () => {
+    const backupDir = createTempDir("paperclip-db-backup-cleanup-failure-");
+    // Pin the timestamp so the final artifact path is known; a directory there makes unlink fail.
+    vi.setSystemTime(new Date(2026, 8, 11, 12, 0, 0));
+    const residual = path.join(backupDir, "paperclip-20260911-120000.sql.gz");
+    fs.mkdirSync(residual);
+    fs.writeFileSync(path.join(residual, "keep"), "x");
+
+    let caught: unknown = null;
+    try {
+      await runDatabaseBackup({
+        connectionString: "postgres://paperclip:paperclip@127.0.0.1:1/paperclip",
+        backupDir,
+        retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+        backupEngine: "javascript",
+        connectTimeoutSeconds: 1,
+      });
+    } catch (error) {
+      caught = error;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    const [originalError, cleanupError, ...rest] = (caught as AggregateError).errors;
+    expect(rest).toEqual([]);
+    expect(originalError).toBeInstanceOf(Error);
+    expect((originalError as NodeJS.ErrnoException).path).not.toBe(residual);
+    expect((cleanupError as NodeJS.ErrnoException).path).toBe(residual);
+    expect(fs.existsSync(residual)).toBe(true);
+    expect(fs.existsSync(path.join(backupDir, STORAGE_TRANSACTION_LOCK_DIR_NAME))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(
+      path.join(backupDir, STORAGE_TRANSACTION_PARTICIPATION_NAME),
+      "utf8",
+    ))).toMatchObject({ state: "active" });
   });
 
   it("fails with a typed busy error without disturbing the held lock or creating artifacts", async () => {

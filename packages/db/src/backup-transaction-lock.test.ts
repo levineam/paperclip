@@ -8,6 +8,7 @@ import {
   STORAGE_TRANSACTION_LOCK_DIR_NAME,
   STORAGE_TRANSACTION_LOCK_SCHEMA,
   STORAGE_TRANSACTION_PARTICIPATION_NAME,
+  STORAGE_TRANSACTION_RECOVERY_MUTEX_NAME,
   STORAGE_TRANSACTION_RESERVED_PREFIX,
   StorageTransactionLockError,
   acquireStorageTransactionLock,
@@ -325,6 +326,34 @@ describe("paperclip.storage-transaction-lock/v1", () => {
     const after = fs.readFileSync(path.join(root, STORAGE_TRANSACTION_LOCK_DIR_NAME), "utf8");
     expect(after).toBe(before);
     expect(JSON.parse(after).token).toBe(owner.token);
+  });
+
+  it("refuses to take over a dead recovery mutex and leaves it for explicit repair", () => {
+    const root = tempDir("paperclip-tx-lock-dead-recovery-");
+    const realRoot = resolveSourceRootRealPath(root);
+    const owner = writeOwner(root);
+    const ownerPath = path.join(realRoot, STORAGE_TRANSACTION_LOCK_DIR_NAME);
+    const mutexPath = path.join(realRoot, STORAGE_TRANSACTION_RECOVERY_MUTEX_NAME);
+    const deadMutex = {
+      ...owner,
+      token: "dead-recovery-token",
+      operationKind: "storage-transaction-recovery",
+    };
+    fs.writeFileSync(mutexPath, `${JSON.stringify(deadMutex)}\n`, { flag: "wx", mode: 0o600 });
+    const mutexBefore = fs.readFileSync(mutexPath, "utf8");
+    const mutexInode = fs.lstatSync(mutexPath).ino;
+    const ownerBefore = fs.readFileSync(ownerPath, "utf8");
+
+    expectLockErrorCode(
+      () => acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" }),
+      "recovery_conflict",
+    );
+
+    expect(fs.lstatSync(mutexPath).ino).toBe(mutexInode);
+    expect(fs.readFileSync(mutexPath, "utf8")).toBe(mutexBefore);
+    expect(fs.readFileSync(ownerPath, "utf8")).toBe(ownerBefore);
+    expect(fs.readdirSync(realRoot).filter((name) => name.includes("quarantine") || name.includes(".tmp.")))
+      .toEqual([]);
   });
 
   it("fails closed on malformed owner evidence without replacing it", () => {

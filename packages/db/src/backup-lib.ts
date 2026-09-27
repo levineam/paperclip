@@ -1,4 +1,13 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -195,6 +204,16 @@ function pruneOldBackups(
   }
 
   return toDelete.length;
+}
+
+/** Fail closed: any lstat outcome other than ENOENT counts as a residual artifact. */
+function backupArtifactAbsent(filePath: string): boolean {
+  try {
+    lstatSync(filePath);
+    return false;
+  } catch (error) {
+    return Boolean(error && typeof error === "object" && (error as NodeJS.ErrnoException).code === "ENOENT");
+  }
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -570,6 +589,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const backupFile = `${sqlFile}.gz`;
   let writer: ReturnType<typeof createBufferedTextFileWriter> | null = null;
   let operationError: unknown = null;
+  const cleanupErrors: unknown[] = [];
 
   try {
     writer = createBufferedTextFileWriter(sqlFile);
@@ -1011,11 +1031,15 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   } catch (error) {
     operationError = error;
     await writer?.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
-    }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
+    for (const artifactPath of [backupFile, sqlFile]) {
+      try {
+        unlinkSync(artifactPath);
+      } catch (cleanupError) {
+        if (!(cleanupError && typeof cleanupError === "object"
+          && (cleanupError as NodeJS.ErrnoException).code === "ENOENT")) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
     }
     throw error;
   } finally {
@@ -1025,16 +1049,20 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     } catch (error) {
       closeError = error;
     }
+    // After a failure, reopen archive eligibility only if no ordinary backup artifact
+    // survived cleanup; otherwise keep the existing active marker so archivers fail closed.
+    const publishReady = operationError === null
+      || (backupArtifactAbsent(backupFile) && backupArtifactAbsent(sqlFile));
     let releaseError: unknown = null;
     try {
-      releaseStorageTransactionLock(lockHandle, { participationState: "ready" });
+      releaseStorageTransactionLock(lockHandle, { participationState: publishReady ? "ready" : "active" });
     } catch (error) {
       releaseError = error;
     }
-    const teardownErrors = [operationError, closeError, releaseError].filter(
+    const teardownErrors = [operationError, ...cleanupErrors, closeError, releaseError].filter(
       (error): error is NonNullable<typeof error> => error !== null,
     );
-    if (closeError || releaseError) {
+    if (cleanupErrors.length > 0 || closeError || releaseError) {
       if (teardownErrors.length === 1) throw teardownErrors[0];
       throw new AggregateError(teardownErrors, "Database backup and storage transaction teardown failed");
     }

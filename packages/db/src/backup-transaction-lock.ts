@@ -413,19 +413,14 @@ function acquireRecoveryMutex(
       const existing = readOwnerRecord(paths.recoveryMutexPath);
       if (!existing) throw new StorageTransactionLockError("recovery_conflict", "Storage transaction recovery ownership changed");
       classifyExisting(existing, identity);
-      const reread = readOwnerRecord(paths.recoveryMutexPath);
-      if (!reread) throw new StorageTransactionLockError("recovery_conflict", "Storage transaction recovery ownership changed");
-      classifyExisting(reread, identity);
-      const quarantined = retireRecord(paths.recoveryMutexPath, paths.sourceRootRealPath, "quarantine", reread.token);
-      safeUnlink(quarantined);
-      try {
-        publishHardLink(temp, paths.recoveryMutexPath);
-      } catch (publishError) {
-        if (isErrno(publishError, "EEXIST")) {
-          throw new StorageTransactionLockError("recovery_conflict", "Storage transaction recovery mutex is busy");
-        }
-        throw publishError;
-      }
+      // Never take over an existing recovery mutex, even when its owner appears dead:
+      // concurrent recoverers could otherwise rename away a live replacement.
+      // A dead mutex is left in place for explicit repair.
+      throw new StorageTransactionLockError(
+        "recovery_conflict",
+        "Storage transaction recovery mutex is held by a dead owner; explicit repair required",
+        { recoveryMutexPath: paths.recoveryMutexPath, holderPid: existing.pid },
+      );
     }
   } finally {
     safeUnlink(temp);
