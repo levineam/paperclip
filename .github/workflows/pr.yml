@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - master
+      - SUP-3276/recovery-owner-write-boundary
 
 concurrency:
   group: pr-${{ github.event.pull_request.number }}
