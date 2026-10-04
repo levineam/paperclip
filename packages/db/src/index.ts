@@ -27,6 +27,11 @@ export {
   type RunDatabaseRestoreOptions,
 } from "./backup-lib.js";
 export {
+  BackupOutputGuardError,
+  resolveBackupOutputGuard,
+  type BackupOutputGuard,
+} from "./backup-output-guard.js";
+export {
   STORAGE_TRANSACTION_LOCK_SCHEMA,
   STORAGE_TRANSACTION_RESERVED_PREFIX,
   STORAGE_TRANSACTION_LOCK_DIR_NAME,

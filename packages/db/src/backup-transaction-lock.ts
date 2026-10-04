@@ -72,6 +72,12 @@ export type AcquireStorageTransactionLockOptions = {
   operationKind: StorageTransactionOperationKind | string;
   allowDeadOwnerRecovery?: boolean;
   nowMs?: number;
+  /**
+   * Guarded backups pin the source root as the process kernel CWD. When set,
+   * `sourceRoot` must be exactly "." and every lock artifact path stays
+   * relative (no mkdir/realpath, no absolute rebuild).
+   */
+  sourceRootIsProcessCwd?: boolean;
 };
 
 export class StorageTransactionLockError extends Error {
@@ -496,7 +502,18 @@ export function isStorageTransactionReservedPath(filePath: string, sourceRoot: s
 export function acquireStorageTransactionLock(
   options: AcquireStorageTransactionLockOptions,
 ): StorageTransactionLockHandle {
-  const sourceRootRealPath = resolveSourceRootRealPath(options.sourceRoot);
+  let sourceRootRealPath: string;
+  if (options.sourceRootIsProcessCwd) {
+    if (options.sourceRoot !== ".") {
+      throw new StorageTransactionLockError(
+        "protocol_fault",
+        "A process-CWD storage transaction root must be exactly \".\"",
+      );
+    }
+    sourceRootRealPath = ".";
+  } else {
+    sourceRootRealPath = resolveSourceRootRealPath(options.sourceRoot);
+  }
   const paths = ownerPaths(sourceRootRealPath);
   const identity = resolveStorageTransactionIdentity();
   const nowMs = options.nowMs ?? Date.now();

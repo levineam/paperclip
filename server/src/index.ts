@@ -611,6 +611,10 @@ export async function startServer(): Promise<StartedServer> {
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        // Present (even blank/malformed) means opted in; the backup run validates and fails closed.
+        ...(config.databaseBackupExpectedVolumeUuid !== undefined
+          ? { outputGuard: { expectedVolumeUuid: config.databaseBackupExpectedVolumeUuid } }
+          : {}),
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {

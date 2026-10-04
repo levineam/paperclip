@@ -1,4 +1,5 @@
 import {
+  constants as fsConstants,
   createReadStream,
   createWriteStream,
   existsSync,
@@ -11,7 +12,7 @@ import {
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
-import { open as openFile } from "node:fs/promises";
+import { open as openFile, type FileHandle } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -20,8 +21,14 @@ import {
   assertStorageTransactionLockHeld,
   isStorageTransactionReservedName,
   releaseStorageTransactionLock,
+  StorageTransactionLockError,
   type StorageTransactionLockHandle,
 } from "./backup-transaction-lock.js";
+import {
+  BackupOutputGuardError,
+  runGuardedDatabaseBackup,
+  type BackupOutputGuard,
+} from "./backup-output-guard.js";
 
 export type BackupRetentionPolicy = {
   dailyDays: number;
@@ -44,6 +51,21 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  /**
+   * Opt-in: confine every backup filesystem effect to `backupDir` on the mounted
+   * volume with this UUID (macOS only). Fails closed when it cannot be verified.
+   */
+  outputGuard?: BackupOutputGuard;
+};
+
+/**
+ * Internal guard session for a backup running with its kernel CWD pinned to the
+ * verified output directory. `verify` is the full identity check; `verifyCheap`
+ * is the per-effect pinned-CWD/path identity check.
+ */
+export type BackupCoreOutputGuard = {
+  verify(stage: string): void;
+  verifyCheap(stage: string): void;
 };
 
 export type RunDatabaseBackupResult = {
@@ -137,6 +159,7 @@ function pruneOldBackups(
   retention: BackupRetentionPolicy,
   filenamePrefix: string,
   lockHandle: StorageTransactionLockHandle,
+  outputGuard: BackupCoreOutputGuard | null = null,
 ): number {
   if (!existsSync(backupDir)) return 0;
 
@@ -153,6 +176,13 @@ function pruneOldBackups(
     if (isStorageTransactionReservedName(name)) continue;
     if (!name.startsWith(`${filenamePrefix}-`)) continue;
     if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
+    if (outputGuard) {
+      // Guarded: the root is the pinned CWD; names stay relative and only regular files count.
+      const stat = lstatSync(name);
+      if (!stat.isFile()) continue;
+      entries.push({ name, fullPath: name, mtimeMs: stat.mtimeMs });
+      continue;
+    }
     const fullPath = resolve(backupDir, name);
     const stat = statSync(fullPath);
     entries.push({ name, fullPath, mtimeMs: stat.mtimeMs });
@@ -197,13 +227,19 @@ function pruneOldBackups(
     toDelete.push(entry.fullPath);
   }
 
+  let prunedCount = 0;
   for (const filePath of toDelete) {
     // Reverify producer lock ownership before every irreversible retention unlink.
     assertStorageTransactionLockHeld(lockHandle);
+    if (outputGuard) {
+      outputGuard.verifyCheap("prune");
+      if (!lstatSync(filePath).isFile()) continue;
+    }
     unlinkSync(filePath);
+    prunedCount += 1;
   }
 
-  return toDelete.length;
+  return prunedCount;
 }
 
 /** Fail closed: any lstat outcome other than ENOENT counts as a residual artifact. */
@@ -214,6 +250,52 @@ function backupArtifactAbsent(filePath: string): boolean {
   } catch (error) {
     return Boolean(error && typeof error === "object" && (error as NodeJS.ErrnoException).code === "ENOENT");
   }
+}
+
+type OwnedFileIdentity = { dev: bigint; ino: bigint };
+
+async function handleIdentity(file: FileHandle): Promise<OwnedFileIdentity> {
+  const stat = await file.stat({ bigint: true });
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+/**
+ * Guarded: the current entry at `name` must still be the regular file this run
+ * created (no symlink following). Returns its stats; throws when replaced.
+ */
+function assertOwnedArtifact(name: string, identity: OwnedFileIdentity | null, stage: string) {
+  let stat;
+  try {
+    stat = lstatSync(name, { bigint: true });
+  } catch (error) {
+    throw new BackupOutputGuardError("replaced", `Guarded backup artifact is missing (${stage}): ${name}`, {
+      stage,
+      name,
+      cause: (error as NodeJS.ErrnoException).code,
+    });
+  }
+  if (!identity || !stat.isFile() || stat.dev !== identity.dev || stat.ino !== identity.ino) {
+    throw new BackupOutputGuardError("replaced", `Guarded backup artifact was replaced (${stage}): ${name}`, { stage, name });
+  }
+  return stat;
+}
+
+/**
+ * Guarded cleanup: unlink `name` only when it is still the regular file this run
+ * created. A replaced or unverifiable entry is left in place. The lstat/unlink pair
+ * is not atomic (Node/macOS offer no identity-conditional unlink); see docs.
+ */
+function retireOwnedArtifact(name: string, identity: OwnedFileIdentity | null): "removed" | "absent" | "replaced" {
+  let stat;
+  try {
+    stat = lstatSync(name, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+    throw error;
+  }
+  if (!identity || !stat.isFile() || stat.dev !== identity.dev || stat.ino !== identity.ino) return "replaced";
+  unlinkSync(name);
+  return "removed";
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -348,39 +430,75 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
-async function runPgDumpBackup(opts: {
+/** Exported for focused tests only; not part of the package entry point. */
+export async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
+  /**
+   * Guarded mode: create the output exclusively before spawning pg_dump and report
+   * the created file's identity from its own handle (null if it could not be read).
+   */
+  onExclusiveCreate?: (identity: OwnedFileIdentity | null) => void;
 }): Promise<void> {
+  const exclusiveOutput = opts.onExclusiveCreate
+    ? await openFile(opts.backupFile, "wx")
+    : null;
+  if (exclusiveOutput) {
+    const identity = await handleIdentity(exclusiveOutput).catch(() => null);
+    opts.onExclusiveCreate!(identity);
+    if (!identity) {
+      await exclusiveOutput.close().catch(() => {});
+      throw new BackupOutputGuardError("unverifiable", `Cannot establish the identity of the backup file: ${opts.backupFile}`);
+    }
+  }
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
-  const child = spawn(
-    pgDumpBin,
-    [
-      `--dbname=${opts.connectionString}`,
-      "--format=plain",
-      "--clean",
-      "--if-exists",
-      "--no-owner",
-      "--no-privileges",
-    ],
-    {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(
+      pgDumpBin,
+      [
+        `--dbname=${opts.connectionString}`,
+        "--format=plain",
+        "--clean",
+        "--if-exists",
+        "--no-owner",
+        "--no-privileges",
+      ],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          PGCONNECT_TIMEOUT: String(opts.connectTimeout),
+        },
       },
-    },
-  );
+    );
+  } catch (error) {
+    await exclusiveOutput?.close().catch(() => {});
+    throw error;
+  }
 
   if (!child.stdout) {
+    await exclusiveOutput?.close();
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
-    waitForChildExit(child, pgDumpBin),
-  ]);
+  const output = pipeline(
+    child.stdout,
+    createGzip(),
+    exclusiveOutput ? exclusiveOutput.createWriteStream() : createWriteStream(opts.backupFile),
+  );
+  const exit = waitForChildExit(child, pgDumpBin);
+  if (!exclusiveOutput) {
+    await Promise.all([output, exit]);
+    return;
+  }
+  // Guarded: never return (and so never clean up, fall back, or release the lock)
+  // while pg_dump or anything holding its stdout is still producing output. A failed
+  // pipeline destroys stdout, so a writing producer ends via EPIPE; there is no kill.
+  const [outputResult, exitResult] = await Promise.allSettled([output, exit]);
+  if (exitResult.status === "rejected") throw exitResult.reason;
+  if (outputResult.status === "rejected") throw outputResult.reason;
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -473,8 +591,21 @@ async function* readRestoreStatements(backupFile: string): AsyncGenerator<string
   }
 }
 
-export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES) {
-  const filePromise = openFile(filePath, "w");
+export function createBufferedTextFileWriter(
+  filePath: string,
+  maxBufferedBytes = DEFAULT_BACKUP_WRITE_BUFFER_BYTES,
+  options: { exclusive?: boolean } = {},
+) {
+  const exclusive = options.exclusive === true;
+  const filePromise = openFile(filePath, exclusive ? "wx" : "w");
+  // Exclusive (guarded) writers record the identity of the file they created through
+  // its own handle and never unlink by name; the guarded core retires it by identity.
+  let created = false;
+  let ownedIdentity: OwnedFileIdentity | null = null;
+  const openSettled = filePromise.then(async (file) => {
+    created = true;
+    if (exclusive) ownedIdentity = await handleIdentity(file).catch(() => null);
+  }, () => {});
   const flushThreshold = Math.max(1, Math.trunc(maxBufferedBytes));
   let bufferedLines: string[] = [];
   let bufferedBytes = 0;
@@ -503,6 +634,22 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
   };
 
   return {
+    /** True once this writer's own open() created the file. */
+    created() {
+      return created;
+    },
+    /** Exclusive mode: identity captured from this writer's own handle at creation (null if unknown). */
+    ownedIdentity(): OwnedFileIdentity | null {
+      return ownedIdentity;
+    },
+    async identity(): Promise<OwnedFileIdentity> {
+      await filePromise;
+      await openSettled;
+      if (!ownedIdentity) {
+        throw new BackupOutputGuardError("unverifiable", `Cannot establish the identity of the backup file: ${filePath}`);
+      }
+      return ownedIdentity;
+    },
     emit(line: string) {
       if (closed) {
         throw new Error(`Cannot write to closed backup file: ${filePath}`);
@@ -544,6 +691,9 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
       bufferedBytes = 0;
       await pendingWrite.catch(() => {});
       await filePromise.then((file) => file.close()).catch(() => {});
+      await openSettled;
+      // Exclusive: leave removal to identity-checked retirement (retireOwnedArtifact).
+      if (exclusive) return;
       if (existsSync(filePath)) {
         try {
           unlinkSync(filePath);
@@ -556,7 +706,27 @@ export function createBufferedTextFileWriter(filePath: string, maxBufferedBytes 
 }
 
 export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise<RunDatabaseBackupResult> {
+  // Any present outputGuard (even malformed) opts in; it is validated before SQL or filesystem work.
+  if (opts.outputGuard !== undefined) return runGuardedDatabaseBackup(opts);
+  return runDatabaseBackupCore(opts, null);
+}
+
+function isGuardAbortError(error: unknown): boolean {
+  return error instanceof BackupOutputGuardError || error instanceof StorageTransactionLockError;
+}
+
+/**
+ * Internal backup core. With `outputGuard`, the process kernel CWD is the pinned,
+ * verified output directory: `opts.backupDir` is ignored, nothing is created
+ * above it, and every effect uses a relative basename.
+ */
+export async function runDatabaseBackupCore(
+  opts: RunDatabaseBackupOptions,
+  outputGuard: BackupCoreOutputGuard | null,
+): Promise<RunDatabaseBackupResult> {
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
+  const backupRoot = outputGuard ? "." : opts.backupDir;
+  const artifactPath = (name: string) => (outputGuard ? name : resolve(opts.backupDir, name));
   const retention = opts.retention;
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
   const backupEngine = opts.backupEngine ?? "auto";
@@ -573,40 +743,67 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
   // Acquire the source-root transaction lock before any backup/prune filesystem activity.
   // Client construction stays outside the hold so a synchronous setup error cannot strand it.
-  mkdirSync(opts.backupDir, { recursive: true });
+  if (!outputGuard) mkdirSync(opts.backupDir, { recursive: true });
   let lockHandle: StorageTransactionLockHandle;
   try {
+    outputGuard?.verify("before-lock");
     lockHandle = acquireStorageTransactionLock({
-      sourceRoot: opts.backupDir,
+      sourceRoot: backupRoot,
       operationKind: "backup",
+      ...(outputGuard ? { sourceRootIsProcessCwd: true } : {}),
     });
   } catch (error) {
     await closeSql();
     throw error;
   }
 
-  const sqlFile = resolve(opts.backupDir, `${filenamePrefix}-${timestamp()}.sql`);
+  const sqlFile = artifactPath(`${filenamePrefix}-${timestamp()}.sql`);
   const backupFile = `${sqlFile}.gz`;
   let writer: ReturnType<typeof createBufferedTextFileWriter> | null = null;
+  // Guarded mode only ever cleans up or accepts a backup file this run created
+  // exclusively, identified by the dev/ino read from the creating handle.
+  let backupFileCreated = false;
+  let backupFileIdentity: OwnedFileIdentity | null = null;
+  const markBackupFileCreated = (identity: OwnedFileIdentity | null) => {
+    backupFileCreated = true;
+    backupFileIdentity = identity;
+  };
   let operationError: unknown = null;
   const cleanupErrors: unknown[] = [];
 
   try {
-    writer = createBufferedTextFileWriter(sqlFile);
+    outputGuard?.verifyCheap("open-sql");
+    writer = createBufferedTextFileWriter(
+      sqlFile,
+      DEFAULT_BACKUP_WRITE_BUFFER_BYTES,
+      { exclusive: outputGuard !== null },
+    );
     const activeWriter = writer;
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
       await sql`SELECT 1`;
       try {
         await closeSql();
+        outputGuard?.verifyCheap("open-pg-dump-output");
         await runPgDumpBackup({
           connectionString: opts.connectionString,
           backupFile,
           connectTimeout,
+          ...(outputGuard ? { onExclusiveCreate: markBackupFileCreated } : {}),
         });
         await activeWriter.abort();
-        const sizeBytes = statSync(backupFile).size;
+        if (outputGuard) {
+          // The unused SQL placeholder is retired by identity; a replacement aborts the run.
+          outputGuard.verifyCheap("unlink-sql");
+          if (retireOwnedArtifact(sqlFile, activeWriter.ownedIdentity()) === "replaced") {
+            throw new BackupOutputGuardError("replaced", `Guarded backup SQL placeholder was replaced: ${sqlFile}`);
+          }
+        }
+        outputGuard?.verify("accept");
+        const sizeBytes = outputGuard
+          ? Number(assertOwnedArtifact(backupFile, backupFileIdentity, "accept").size)
+          : statSync(backupFile).size;
         assertStorageTransactionLockHeld(lockHandle);
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix, lockHandle);
+        const prunedCount = pruneOldBackups(backupRoot, retention, filenamePrefix, lockHandle, outputGuard);
         return {
           backupFile,
           sizeBytes,
@@ -614,11 +811,25 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           lockTokenPrefix: lockHandle.token.slice(0, 8),
         };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
-        if (backupEngine === "pg_dump") {
-          throw error;
+        if (outputGuard) {
+          // A guard or lock failure aborts; never fall back to a fresh JavaScript run.
+          // The outer handler retires owned artifacts by identity.
+          if (backupEngine === "pg_dump" || isGuardAbortError(error)) throw error;
+          if (backupFileCreated) {
+            // Only our own file may be removed; a replacement is preserved and aborts
+            // (the fallback's exclusive create would never overwrite it either).
+            if (retireOwnedArtifact(backupFile, backupFileIdentity) === "replaced") {
+              throw new BackupOutputGuardError("replaced", `Guarded backup file was replaced before fallback: ${backupFile}`);
+            }
+            backupFileCreated = false;
+            backupFileIdentity = null;
+          }
+          outputGuard.verify("fallback");
+        } else {
+          if (existsSync(backupFile)) {
+            try { unlinkSync(backupFile); } catch { /* ignore */ }
+          }
+          if (backupEngine === "pg_dump") throw error;
         }
         sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
         sqlClosed = false;
@@ -1010,17 +1221,46 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("COMMIT;");
     emit("");
 
+    const sqlIdentity = outputGuard ? await activeWriter.identity() : null;
     await activeWriter.close();
 
     // Compress the SQL file with gzip
-    const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
-    unlinkSync(sqlFile);
+    if (outputGuard && sqlIdentity) {
+      outputGuard.verifyCheap("compress");
+      const source = await openFile(sqlFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try {
+        const sourceStat = await source.stat({ bigint: true });
+        if (!sourceStat.isFile() || sourceStat.dev !== sqlIdentity.dev || sourceStat.ino !== sqlIdentity.ino) {
+          throw new BackupOutputGuardError("replaced", "Guarded backup SQL file changed before compression");
+        }
+        const target = await openFile(backupFile, "wx");
+        const targetIdentity = await handleIdentity(target).catch(() => null);
+        markBackupFileCreated(targetIdentity);
+        if (!targetIdentity) {
+          await target.close().catch(() => {});
+          throw new BackupOutputGuardError("unverifiable", `Cannot establish the identity of the backup file: ${backupFile}`);
+        }
+        await pipeline(source.createReadStream({ autoClose: false }), createGzip(), target.createWriteStream());
+      } finally {
+        await source.close().catch(() => {});
+      }
+      outputGuard.verifyCheap("unlink-sql");
+      if (retireOwnedArtifact(sqlFile, sqlIdentity) === "replaced") {
+        throw new BackupOutputGuardError("replaced", `Guarded backup SQL file was replaced before removal: ${sqlFile}`);
+      }
+    } else {
+      const sqlReadStream = createReadStream(sqlFile);
+      const gzWriteStream = createWriteStream(backupFile);
+      await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+      unlinkSync(sqlFile);
+    }
 
     assertStorageTransactionLockHeld(lockHandle);
-    const sizeBytes = statSync(backupFile).size;
-    const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix, lockHandle);
+    outputGuard?.verify("accept");
+    const sizeBytes = outputGuard
+      ? Number(assertOwnedArtifact(backupFile, backupFileIdentity, "accept").size)
+      : statSync(backupFile).size;
+    const prunedCount = pruneOldBackups(backupRoot, retention, filenamePrefix, lockHandle, outputGuard);
 
     return {
       backupFile,
@@ -1031,6 +1271,29 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   } catch (error) {
     operationError = error;
     await writer?.abort();
+    if (outputGuard) {
+      // Retire only entries that are still the regular files this run created. A
+      // replaced or unverifiable entry is preserved, reported, and (being present)
+      // keeps the participation marker active below.
+      const owned: Array<[string, OwnedFileIdentity | null]> = [
+        ...(backupFileCreated ? [[backupFile, backupFileIdentity] as [string, OwnedFileIdentity | null]] : []),
+        ...(writer?.created() ? [[sqlFile, writer.ownedIdentity()] as [string, OwnedFileIdentity | null]] : []),
+      ];
+      for (const [artifactPath, identity] of owned) {
+        try {
+          if (retireOwnedArtifact(artifactPath, identity) === "replaced") {
+            cleanupErrors.push(new BackupOutputGuardError(
+              "residual_replaced",
+              `Left a replaced or unverifiable guarded backup artifact in place: ${artifactPath}`,
+              { name: artifactPath },
+            ));
+          }
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+      throw error;
+    }
     for (const artifactPath of [backupFile, sqlFile]) {
       try {
         unlinkSync(artifactPath);
@@ -1049,9 +1312,34 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     } catch (error) {
       closeError = error;
     }
+    // Transaction completion point: every producer and the SQL client teardown have
+    // settled, and nothing has been published or returned yet. A guarded success is
+    // only accepted if the full pinned-directory/UUID binding and the handle-derived
+    // identity of the final artifact still hold here; otherwise the run fails.
+    let completionError: unknown = null;
+    if (outputGuard && operationError === null) {
+      try {
+        outputGuard.verify("complete");
+        assertOwnedArtifact(backupFile, backupFileIdentity, "complete");
+      } catch (error) {
+        completionError = error;
+        try {
+          // Relative to the pinned directory; only our own file is removed.
+          if (retireOwnedArtifact(backupFile, backupFileIdentity) === "replaced") {
+            cleanupErrors.push(new BackupOutputGuardError(
+              "residual_replaced",
+              `Left a replaced or unverifiable guarded backup artifact in place: ${backupFile}`,
+              { name: backupFile },
+            ));
+          }
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
+      }
+    }
     // After a failure, reopen archive eligibility only if no ordinary backup artifact
     // survived cleanup; otherwise keep the existing active marker so archivers fail closed.
-    const publishReady = operationError === null
+    const publishReady = (operationError === null && completionError === null)
       || (backupArtifactAbsent(backupFile) && backupArtifactAbsent(sqlFile));
     let releaseError: unknown = null;
     try {
@@ -1059,10 +1347,10 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     } catch (error) {
       releaseError = error;
     }
-    const teardownErrors = [operationError, ...cleanupErrors, closeError, releaseError].filter(
+    const teardownErrors = [operationError, completionError, ...cleanupErrors, closeError, releaseError].filter(
       (error): error is NonNullable<typeof error> => error !== null,
     );
-    if (cleanupErrors.length > 0 || closeError || releaseError) {
+    if (completionError || cleanupErrors.length > 0 || closeError || releaseError) {
       if (teardownErrors.length === 1) throw teardownErrors[0];
       throw new AggregateError(teardownErrors, "Database backup and storage transaction teardown failed");
     }

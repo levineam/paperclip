@@ -621,6 +621,68 @@ Environment overrides:
 - `PAPERCLIP_DB_BACKUP_INTERVAL_MINUTES=<minutes>`
 - `PAPERCLIP_DB_BACKUP_RETENTION_DAYS=<days>`
 - `PAPERCLIP_DB_BACKUP_DIR=/absolute/or/~/path`
+- `PAPERCLIP_DB_BACKUP_EXPECTED_VOLUME_UUID=<volume UUID>` (see below)
+
+### Backup output guard (opt-in, macOS)
+
+To make sure backups only ever land on a specific mounted volume (for example an
+encrypted external disk), set `database.backup.expectedVolumeUuid` in config, the
+`PAPERCLIP_DB_BACKUP_EXPECTED_VOLUME_UUID` env var (wins over config, even when set
+to an empty string), or `paperclipai db:backup --expected-volume-uuid <uuid>` (wins
+over both). Find the UUID with `diskutil info <mount point>` ("Volume UUID"). The
+server's scheduled and manual backups, `paperclipai db:backup`, and `pnpm db:backup`
+all honor it.
+
+When set, each backup runs in a short-lived child process that:
+
+- resolves the UUID with `diskutil info -plist`, checks the device node matches the
+  mount point's device, and that the mount point really is a mount root;
+- requires the backup dir to be lexically inside that mount point, rejects any
+  symlinked directory component, and creates missing directories (mode `0700`) one
+  level at a time from inside already-verified directories, re-resolving the UUID
+  and re-checking the pinned directory after every step and before any creation;
+- pins its working directory to the verified backup dir and does every write,
+  temp file, lock/marker update, cleanup, retention delete and lock release by
+  relative name, so renaming or replacing the path (or remounting something else
+  there) mid-run cannot redirect writes; it re-checks identity before the lock, an
+  `auto` engine fallback, final acceptance and retention, and before each open and
+  delete, and aborts (no fallback) if anything changed;
+- retention only deletes regular files (never follows symlinks);
+- records the device/inode of each file it creates exclusively (from the open
+  handle) and only removes, compresses from, or reports a backup when the name is
+  still that same regular file. A replaced entry (other file or symlink) fails the
+  run, is left in place, and keeps the participation marker `active`.
+
+Limits: check-then-unlink is not atomic (Node/macOS have no identity-conditional
+unlink), so a process that can write inside the backup directory and swaps a name
+in the instant between the check and the unlink can still get its file removed, and
+can replace the accepted backup after the run completes; such writes stay confined to
+the verified directory. The run's completion point is after all producers and the SQL
+client teardown have settled: the full volume/directory binding and the final backup
+file's identity are re-checked there, before the participation marker is set to
+`ready` and before success is returned.
+
+Behavior change for config files: only a missing config file (ENOENT) means defaults.
+An existing config file that cannot be read, is not valid JSON, or fails validation is
+treated as uncertain (it might carry the guard in any spelling): the server keeps
+serving but refuses all backups until the file is fixed, `pnpm db:backup` (which also
+rejects a non-object `database`/`database.backup`) and `paperclipai db:backup` exit
+before creating anything. This applies even when the guard is not configured.
+
+It fails closed, creating, writing and deleting nothing outside the verified directory,
+when the volume is absent, the UUID resolves to a different or unverifiable volume, the
+dir is outside the volume, a component is a symlink, the platform isn't macOS, or the
+configured value is blank, `null`, or otherwise malformed (it never falls back to an
+unguarded backup). A guarded `pg_dump` run also waits for pg_dump and its output
+stream to both finish before any cleanup, fallback, or lock release. If
+detection happens after the run starts, its own partial files in the original
+directory are cleaned up and the lock is released there; if a partial file can't be
+removed, the participation marker stays `active` as usual. With the guard set,
+`filenamePrefix` must match `[A-Za-z0-9][A-Za-z0-9._-]*`.
+
+Without the setting, behavior is unchanged. Worktree seed backups (`paperclipai
+worktree init`) write to their own seed destination and stay unguarded unless that
+caller passes an explicit guard.
 
 DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if
