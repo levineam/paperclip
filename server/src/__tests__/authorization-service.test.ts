@@ -1044,6 +1044,60 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.explanation).toContain("another company");
   });
 
+  it("denies manager-chain active-checkout management over the actor itself but keeps CEO authority", async () => {
+    const company = await createCompany(db, "CheckoutSelf");
+    const ordinaryAgent = await createAgent(db, company.id, { role: "engineer" });
+    const ceoAgent = await createAgent(db, company.id, { role: "ceo" });
+
+    const ordinarySelf = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ordinaryAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "tasks:manage_active_checkouts",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: ordinaryAgent.id },
+    });
+    const ceoSelf = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: ceoAgent.id, companyId: company.id, source: "agent_jwt" },
+      action: "tasks:manage_active_checkouts",
+      resource: { type: "issue", companyId: company.id, assigneeAgentId: ceoAgent.id },
+    });
+
+    expect(ordinarySelf).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+    expect(ceoSelf).toMatchObject({
+      allowed: true,
+      reason: "allow_legacy_agent_creator",
+    });
+  });
+
+  it("allows manager-chain active-checkout management over direct and transitive reports only", async () => {
+    const company = await createCompany(db, "CheckoutManager");
+    const managerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const directReport = await createAgent(db, company.id, { reportsTo: managerAgent.id });
+    const transitiveReport = await createAgent(db, company.id, { reportsTo: directReport.id });
+    const unrelatedPeer = await createAgent(db, company.id);
+
+    const decideFor = (assigneeAgentId: string) =>
+      authorizationService(db).decide({
+        actor: { type: "agent", agentId: managerAgent.id, companyId: company.id, source: "agent_jwt" },
+        action: "tasks:manage_active_checkouts",
+        resource: { type: "issue", companyId: company.id, assigneeAgentId },
+      });
+
+    expect(await decideFor(directReport.id)).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+    expect(await decideFor(transitiveReport.id)).toMatchObject({
+      allowed: true,
+      reason: "allow_manager_chain",
+    });
+    expect(await decideFor(unrelatedPeer.id)).toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
   it("allows scoped assignment inside a granted project and denies other projects", async () => {
     const company = await createCompany(db, "ProjectScope");
     const project = await createProject(db, company.id, "Allowed");
