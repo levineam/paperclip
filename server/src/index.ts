@@ -24,6 +24,7 @@ import {
   reconcilePendingMigrationHistory,
   formatDatabaseBackupResult,
   runDatabaseBackup,
+  StorageTransactionLockError,
   authUsers,
   companies,
   companyMemberships,
@@ -610,6 +611,10 @@ export async function startServer(): Promise<StartedServer> {
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        // Present (even blank/malformed) means opted in; the backup run validates and fails closed.
+        ...(config.databaseBackupExpectedVolumeUuid !== undefined
+          ? { outputGuard: { expectedVolumeUuid: config.databaseBackupExpectedVolumeUuid } }
+          : {}),
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -635,6 +640,16 @@ export async function startServer(): Promise<StartedServer> {
       );
       return response;
     } catch (err) {
+      if (err instanceof StorageTransactionLockError && err.code === "busy") {
+        if (trigger === "scheduled") {
+          logger.warn(
+            { backupDir: config.databaseBackupDir, trigger, reason: err.code },
+            "Skipping scheduled database backup because the storage transaction lock is busy",
+          );
+          return null;
+        }
+        throw conflict(err.message, { code: err.code });
+      }
       logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
       throw err;
     } finally {

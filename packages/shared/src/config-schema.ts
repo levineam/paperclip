@@ -25,6 +25,13 @@ export const databaseBackupConfigSchema = z.object({
   intervalMinutes: z.number().int().min(1).max(7 * 24 * 60).default(60),
   retentionDays: z.number().int().min(1).max(3650).default(7),
   dir: z.string().default("~/.paperclip/instances/default/data/backups"),
+  /**
+   * Opt-in output guard (macOS): backups run only when `dir` is on the mounted
+   * volume with this UUID. Accepted unvalidated here (any JSON value, including
+   * null) so a malformed value neither invalidates the whole config file nor
+   * gets dropped; backup callers validate it and fail closed.
+   */
+  expectedVolumeUuid: z.unknown().optional(),
 });
 
 export const databaseConfigSchema = z.object({

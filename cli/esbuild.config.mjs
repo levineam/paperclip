@@ -1,7 +1,8 @@
 /**
  * esbuild configuration for building the paperclipai CLI for npm.
  *
- * Bundles all workspace packages (@paperclipai/*) into a single file.
+ * Bundles all workspace packages (@paperclipai/*) into dist/index.js, plus the
+ * isolated backup output guard child into dist/backup-output-guard-entry.js.
  * External npm packages remain as regular dependencies.
  */
 
@@ -54,12 +55,19 @@ for (const name of externalWorkspacePackages) {
 
 /** @type {import('esbuild').BuildOptions} */
 export default {
-  entryPoints: ["src/index.ts"],
+  // The backup output guard forks an isolated child from the file next to the
+  // bundled code (dist/backup-output-guard-entry.js), so it must be emitted as its
+  // own self-contained entry beside dist/index.js. Without it, guarded
+  // `db:backup` always fails closed with a missing child.
+  entryPoints: {
+    index: resolve(__dirname, "src/index.ts"),
+    "backup-output-guard-entry": resolve(repoRoot, "packages/db/src/backup-output-guard-entry.ts"),
+  },
   bundle: true,
   platform: "node",
   target: "node20",
   format: "esm",
-  outfile: "dist/index.js",
+  outdir: resolve(__dirname, "dist"),
   banner: { js: "#!/usr/bin/env node" },
   external: [...externals].sort(),
   treeShaking: true,

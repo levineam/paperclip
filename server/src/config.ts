@@ -1,9 +1,9 @@
 import { readConfigFile } from "./config-file.js";
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
-import { resolvePaperclipEnvPath } from "./paths.js";
+import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 import { maybeRepairLegacyWorktreeConfigAndEnvFiles } from "./worktree-config.js";
 import {
   AUTH_BASE_URL_MODES,
@@ -69,6 +69,11 @@ export interface Config {
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  /**
+   * Opt-in backup output guard as configured (raw; validated by the backup run,
+   * which fails closed on blank/malformed values). Undefined means unguarded.
+   */
+  databaseBackupExpectedVolumeUuid: string | undefined;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
@@ -106,6 +111,23 @@ function detectTailnetBindHost(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * readConfigFile() returns null for a missing, unreadable, unparseable, or
+ * schema-invalid file. Only a missing file (ENOENT) means "not configured". Any
+ * existing file it discarded may have carried the backup guard (in any JSON
+ * spelling), so keep the opt-in present (blank, hence invalid): backups are
+ * refused while the server keeps serving. No text heuristics.
+ */
+function unparsedConfigBackupGuardMarker(): string | undefined {
+  const configPath = resolvePaperclipConfigPath();
+  try {
+    readFileSync(configPath);
+  } catch (error) {
+    if (error && typeof error === "object" && (error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+  }
+  return "";
 }
 
 export function loadConfig(): Config {
@@ -265,6 +287,17 @@ export function loadConfig(): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  const configuredExpectedVolumeUuid = fileConfig
+    ? fileDatabaseBackup?.expectedVolumeUuid
+    : unparsedConfigBackupGuardMarker();
+  // Any present non-string (e.g. null) stays opted in as an invalid blank value.
+  const databaseBackupExpectedVolumeUuid =
+    process.env.PAPERCLIP_DB_BACKUP_EXPECTED_VOLUME_UUID ??
+      (configuredExpectedVolumeUuid === undefined
+        ? undefined
+        : typeof configuredExpectedVolumeUuid === "string"
+          ? configuredExpectedVolumeUuid
+          : "");
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -307,6 +340,7 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    databaseBackupExpectedVolumeUuid,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"

@@ -31,7 +31,8 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  // Same runId contract as the real adapter execution context (heartbeat passes run.id).
+  vi.fn(async (_ctx: { runId: string }) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -50,6 +51,124 @@ vi.mock("../adapters/index.ts", async () => {
       supportsLocalAgentJwt: false,
       execute: mockAdapterExecute,
     })),
+  };
+});
+
+// Teardown quiescence accounting over the two real dependencies that bracket
+// heartbeat's only detached work. Every `void executeRun(...)` is spawned inside a
+// withAgentStartLock section (startNextQueuedRunForAgent returns the claimed runs),
+// and every executeRun that reaches its outer finally awaits
+// releaseRuntimeServicesForRun before its final startNextQueuedRunForAgent tail,
+// which takes the start lock again. Both mocks delegate to the real implementations;
+// holds are used only by the dedicated drain regression case.
+const runAccounting = vi.hoisted(() => {
+  type Gate = { promise: Promise<void>; resolve: () => void };
+  const gate = (): Gate => {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  };
+  type Hold = { reached: Gate; release: Gate };
+  const activeHolds = new Set<Hold>();
+  // Run-keyed adapter barriers for the drain regression case; created lazily by
+  // whichever comes first, the adapter entry or the test, so no entry is lost.
+  type AdapterGate = { entered: Gate; release: Gate };
+  const adapterGates = new Map<string, AdapterGate>();
+  const enteredRunIds = new Set<string>();
+  return {
+    lockInFlight: 0,
+    releaseInFlight: 0,
+    // Monotonic: bumped on every start-lock entry and every runtime-release completion.
+    generation: 0,
+    spawned: new Set<string>(),
+    released: new Set<string>(),
+    releaseHolds: new Map<string, Hold>(),
+    nextLockHold: null as Hold | null,
+    enteredRunIds,
+    adapterGate(runId: string): AdapterGate {
+      let existing = adapterGates.get(runId);
+      if (!existing) {
+        existing = { entered: gate(), release: gate() };
+        adapterGates.set(runId, existing);
+      }
+      return existing;
+    },
+    hold(): Hold {
+      const created = { reached: gate(), release: gate() };
+      activeHolds.add(created);
+      return created;
+    },
+    releaseAllHolds(): void {
+      for (const held of activeHolds) held.release.resolve();
+      for (const adapterGate of adapterGates.values()) adapterGate.release.resolve();
+    },
+    clearHolds(): void {
+      activeHolds.clear();
+      adapterGates.clear();
+      enteredRunIds.clear();
+    },
+  };
+});
+
+vi.mock("../services/agent-start-lock.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/agent-start-lock.ts")>(
+    "../services/agent-start-lock.ts",
+  );
+  return {
+    ...actual,
+    withAgentStartLock: async <T>(agentId: string, fn: () => Promise<T>): Promise<T> => {
+      runAccounting.generation += 1;
+      runAccounting.lockInFlight += 1;
+      try {
+        const held = runAccounting.nextLockHold;
+        runAccounting.nextLockHold = null;
+        const result = await actual.withAgentStartLock(agentId, async () => {
+          if (held) {
+            held.reached.resolve();
+            await held.release.promise;
+          }
+          return fn();
+        });
+        // Runs returned by startNextQueuedRunForAgent each had executeRun spawned.
+        if (Array.isArray(result)) {
+          for (const row of result) {
+            const id = (row as { id?: unknown } | null)?.id;
+            if (typeof id === "string") runAccounting.spawned.add(id);
+          }
+        }
+        return result;
+      } finally {
+        runAccounting.lockInFlight -= 1;
+      }
+    },
+  };
+});
+
+vi.mock("../services/workspace-runtime.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/workspace-runtime.ts")>(
+    "../services/workspace-runtime.ts",
+  );
+  return {
+    ...actual,
+    releaseRuntimeServicesForRun: async (runId: string) => {
+      // A held run models executeRun still finalizing after its terminal status:
+      // not yet an in-flight release and not yet released.
+      const held = runAccounting.releaseHolds.get(runId);
+      if (held) {
+        held.reached.resolve();
+        await held.release.promise;
+      }
+      runAccounting.releaseInFlight += 1;
+      try {
+        return await actual.releaseRuntimeServicesForRun(runId);
+      } finally {
+        runAccounting.released.add(runId);
+        runAccounting.releaseInFlight -= 1;
+        runAccounting.generation += 1;
+      }
+    },
   };
 });
 
@@ -87,6 +206,28 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
   return fn();
 }
 
+async function heartbeatRunsIdle(db: ReturnType<typeof createDb>) {
+  const runs = await db
+    .select({ status: heartbeatRuns.status })
+    .from(heartbeatRuns);
+  return !runs.some((run) => run.status === "queued" || run.status === "running");
+}
+
+/**
+ * Quiescent only when no run is queued/running, no start-lock section or runtime
+ * release is in flight, every spawned execution has reached its release, and the
+ * activity generation is unchanged across this sample's DB await. A release
+ * resumes into its start-lock tail without I/O, so a release that finished before
+ * the await bumps the generation again (tail entry) before the await completes.
+ */
+async function heartbeatSettled(db: ReturnType<typeof createDb>) {
+  const generationBefore = runAccounting.generation;
+  const idle = await heartbeatRunsIdle(db);
+  const accounted = runAccounting.lockInFlight === 0 && runAccounting.releaseInFlight === 0 && [...runAccounting.spawned].every((runId) => runAccounting.released.has(runId));
+  const stable = runAccounting.generation === generationBefore;
+  return idle && accounted && stable;
+}
+
 describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
@@ -111,13 +252,16 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       model: "test-model",
     }));
     runningProcesses.clear();
+    // Never strand teardown on a regression-case hold; data cleanup waits for quiescence.
+    runAccounting.releaseAllHolds();
     let idlePolls = 0;
+    let idleGeneration = -1;
     for (let attempt = 0; attempt < 100; attempt += 1) {
-      const runs = await db
-        .select({ status: heartbeatRuns.status })
-        .from(heartbeatRuns);
-      const hasActiveRun = runs.some((run) => run.status === "queued" || run.status === "running");
-      if (!hasActiveRun) {
+      const generation = runAccounting.generation;
+      if (await heartbeatSettled(db)) {
+        // All counted polls must observe one unchanged generation.
+        if (idlePolls > 0 && generation !== idleGeneration) idlePolls = 0;
+        if (idlePolls === 0) idleGeneration = generation;
         idlePolls += 1;
         if (idlePolls >= 3) break;
       } else {
@@ -125,7 +269,20 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Final synchronous check: nothing ran since the last counted poll.
+    if (
+      idlePolls < 3
+      || runAccounting.generation !== idleGeneration
+      || runAccounting.lockInFlight !== 0
+      || runAccounting.releaseInFlight !== 0
+    ) {
+      throw new Error("Heartbeat work did not quiesce before teardown; refusing to delete fixture rows");
+    }
+    runAccounting.spawned.clear();
+    runAccounting.released.clear();
+    runAccounting.releaseHolds.clear();
+    runAccounting.nextLockHold = null;
+    runAccounting.clearHolds();
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(companySkills);
@@ -544,6 +701,204 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       expect(mockAdapterExecute.mock.calls.length).toBeGreaterThanOrEqual(2);
     } finally {
       finishFirstRun();
+    }
+  }, 40_000);
+
+  it("waits for post-terminal finalization and follow-on queued starts before teardown", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const finalizingIssueId = randomUUID();
+    const runningIssueId = randomUUID();
+    const queuedIssueId = randomUUID();
+    const adapterResult = (summary: string) => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      summary,
+      provider: "test",
+      model: "test-model",
+    });
+    // The previous afterEach has drained; start this case with no adapter call history.
+    // Every adapter entry is held on its own runId; afterEach's mockReset removes this
+    // implementation and its hold release frees any entry still waiting.
+    mockAdapterExecute.mockClear();
+    mockAdapterExecute.mockImplementation(async (ctx: { runId: string }) => {
+      if (typeof ctx?.runId !== "string" || ctx.runId.length === 0) {
+        throw new Error("Adapter invoked without a runId");
+      }
+      const adapterGate = runAccounting.adapterGate(ctx.runId);
+      runAccounting.enteredRunIds.add(ctx.runId);
+      adapterGate.entered.resolve();
+      await adapterGate.release.promise;
+      return adapterResult(`Run ${ctx.runId} completed.`);
+    });
+    const adapterEntered = (runId: string) => runAccounting.adapterGate(runId).entered.promise;
+    const finishAdapter = (runId: string) => runAccounting.adapterGate(runId).release.resolve();
+    const expectEnteredRuns = (runIds: string[]) =>
+      expect([...runAccounting.enteredRunIds].sort()).toEqual([...runIds].sort());
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: finalizingIssueId, companyId, title: "Finalizing assignment", status: "todo", priority: "high", assigneeAgentId: agentId },
+      { id: runningIssueId, companyId, title: "Running assignment", status: "todo", priority: "high", assigneeAgentId: agentId },
+      { id: queuedIssueId, companyId, title: "Queued assignment", status: "todo", priority: "high", assigneeAgentId: agentId },
+    ]);
+    const assign = (issueId: string) => heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+    });
+    const runStatus = (runId: string) => db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0]?.status ?? null);
+
+    try {
+      // Phase 1: the only run is terminal but still finalizing (held before its
+      // runtime release). Statuses alone are idle; the drain must not settle.
+      const finalizingHold = runAccounting.hold();
+      const finalizingWake = await assign(finalizingIssueId);
+      expect(finalizingWake).not.toBeNull();
+      // Same as the original maxConcurrentRuns case: the run's own issue comment
+      // satisfies the comment policy, so no missing-comment retry is queued.
+      await db.insert(issueComments).values({
+        companyId,
+        issueId: finalizingIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: finalizingWake!.id,
+        body: "Finalizing assignment run completed.",
+      });
+      runAccounting.releaseHolds.set(finalizingWake!.id, finalizingHold);
+      await adapterEntered(finalizingWake!.id);
+      expectEnteredRuns([finalizingWake!.id]);
+      // Real terminal task disposition before the run finishes: a done issue is a valid
+      // disposition, so no successful-run handoff is queued (successful-run-handoff.ts:375).
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, finalizingIssueId));
+      finishAdapter(finalizingWake!.id);
+      await finalizingHold.reached.promise;
+
+      expect(await runStatus(finalizingWake!.id)).toBe("succeeded");
+      expect(await heartbeatRunsIdle(db)).toBe(true);
+      expect(runAccounting.spawned.has(finalizingWake!.id)).toBe(true);
+      expect(runAccounting.lockInFlight).toBe(0);
+      expect(runAccounting.releaseInFlight).toBe(0);
+      expect(await heartbeatSettled(db)).toBe(false);
+      // Fixture-created post-terminal write in the finalization window (real FK row).
+      // This proves the drain covers that window; it does not attribute the CI comment.
+      await db.insert(issueComments).values({
+        companyId,
+        issueId: finalizingIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: finalizingWake!.id,
+        body: "Late finalization write.",
+      });
+
+      // Phase 1b: release finishes, the start-lock tail is held. Statuses idle,
+      // release accounted; only the in-flight tail keeps the drain open.
+      const tailHold = runAccounting.hold();
+      runAccounting.nextLockHold = tailHold;
+      const generationBeforeRelease = runAccounting.generation;
+      finalizingHold.release.resolve();
+      await tailHold.reached.promise;
+      // Release completion and tail lock entry each advanced the generation.
+      expect(runAccounting.generation).toBeGreaterThanOrEqual(generationBeforeRelease + 2);
+      expect(runAccounting.released.has(finalizingWake!.id)).toBe(true);
+      expect(runAccounting.releaseInFlight).toBe(0);
+      expect(await heartbeatRunsIdle(db)).toBe(true);
+      expect(await heartbeatSettled(db)).toBe(false);
+      tailHold.release.resolve();
+      expect(await waitForCondition(() => heartbeatSettled(db), 10_000)).toBe(true);
+      expectEnteredRuns([finalizingWake!.id]);
+
+      // Phase 2: a queued run is started by the finishing run's tail and is itself
+      // held after its terminal status. Once statuses are idle again, only the
+      // tail-spawned, not-yet-released execution keeps the drain open.
+      const runningWake = await assign(runningIssueId);
+      expect(runningWake).not.toBeNull();
+      await db.insert(issueComments).values({
+        companyId,
+        issueId: runningIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: runningWake!.id,
+        body: "Running assignment run completed.",
+      });
+      await adapterEntered(runningWake!.id);
+      expectEnteredRuns([finalizingWake!.id, runningWake!.id]);
+      expect(await runStatus(runningWake!.id)).toBe("running");
+      const queuedWake = await assign(queuedIssueId);
+      expect(queuedWake).not.toBeNull();
+      await db.insert(issueComments).values({
+        companyId,
+        issueId: queuedIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: queuedWake!.id,
+        body: "Queued assignment run completed.",
+      });
+      expect(await runStatus(queuedWake!.id)).toBe("queued");
+      expect(runAccounting.spawned.has(queuedWake!.id)).toBe(false);
+      const followOnHold = runAccounting.hold();
+      runAccounting.releaseHolds.set(queuedWake!.id, followOnHold);
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, runningIssueId));
+      finishAdapter(runningWake!.id);
+      // The finishing run's start-lock tail claims the queued run; once it is running,
+      // complete its issue too before letting its adapter finish.
+      await adapterEntered(queuedWake!.id);
+      expectEnteredRuns([finalizingWake!.id, runningWake!.id, queuedWake!.id]);
+      expect(await runStatus(queuedWake!.id)).toBe("running");
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, queuedIssueId));
+      finishAdapter(queuedWake!.id);
+      await followOnHold.reached.promise;
+
+      expect(await runStatus(runningWake!.id)).toBe("succeeded");
+      expect(await runStatus(queuedWake!.id)).toBe("succeeded");
+      expect(await heartbeatRunsIdle(db)).toBe(true);
+      expect(runAccounting.spawned.has(queuedWake!.id)).toBe(true);
+      expect(runAccounting.released.has(queuedWake!.id)).toBe(false);
+      expect(runAccounting.lockInFlight).toBe(0);
+      expect(runAccounting.releaseInFlight).toBe(0);
+      expect(await heartbeatSettled(db)).toBe(false);
+      await db.insert(issueComments).values({
+        companyId,
+        issueId: queuedIssueId,
+        authorAgentId: agentId,
+        authorType: "agent",
+        createdByRunId: queuedWake!.id,
+        body: "Late follow-on finalization write.",
+      });
+      followOnHold.release.resolve();
+      expect(await waitForCondition(() => heartbeatSettled(db), 10_000)).toBe(true);
+      expectEnteredRuns([finalizingWake!.id, runningWake!.id, queuedWake!.id]);
+    } finally {
+      runAccounting.releaseAllHolds();
     }
   }, 40_000);
 
