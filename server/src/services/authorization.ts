@@ -1486,6 +1486,10 @@ export function authorizationService(db: Db) {
       input.action === "tasks:manage_active_checkouts" &&
       input.resource.type === "issue" &&
       input.resource.assigneeAgentId &&
+      // Managing a reporting chain means managing another agent. The subtree
+      // predicate is self-inclusive for scoped grants; self-management of an
+      // active checkout needs an explicit grant or legacy creator authority.
+      input.resource.assigneeAgentId !== actorAgentId &&
       await isManagerOf(companyId, actorAgentId, input.resource.assigneeAgentId)
     ) {
       return allow({

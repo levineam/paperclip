@@ -14,8 +14,15 @@ function findConfigFileFromAncestors(startDir: string): string | null {
 
   while (true) {
     const candidate = path.resolve(currentDir, ".paperclip", DEFAULT_CONFIG_BASENAME);
-    if (fs.existsSync(candidate)) {
+    try {
+      fs.statSync(candidate);
       return candidate;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code;
+      // Only genuine absence keeps searching. Any other inspection error (EACCES, ...)
+      // returns this uncertain candidate so readConfig fails closed instead of the
+      // search silently falling back to the default config.
+      if (code !== "ENOENT" && code !== "ENOTDIR") return candidate;
     }
 
     const nextDir = path.resolve(currentDir, "..");
@@ -32,9 +39,9 @@ export function resolveConfigPath(overridePath?: string): string {
   return findConfigFileFromAncestors(process.cwd()) ?? resolveDefaultConfigPath(resolvePaperclipInstanceId());
 }
 
-function parseJson(filePath: string): unknown {
+function parseJson(filePath: string, text: string): unknown {
   try {
-    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    return JSON.parse(text);
   } catch (err) {
     throw new Error(`Failed to parse JSON at ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -85,8 +92,17 @@ function formatValidationError(err: unknown): string {
 
 export function readConfig(configPath?: string): PaperclipConfig | null {
   const filePath = resolveConfigPath(configPath);
-  if (!fs.existsSync(filePath)) return null;
-  const raw = parseJson(filePath);
+  let text: string;
+  try {
+    text = fs.readFileSync(filePath, "utf-8");
+  } catch (err) {
+    // Only a genuinely missing file means "no config". existsSync() also reports false
+    // for EACCES or an uninspectable parent, which would silently select defaults
+    // (and, for db:backup, drop a configured output guard).
+    if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") return null;
+    throw new Error(`Failed to read config at ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const raw = parseJson(filePath, text);
   const migrated = migrateLegacyConfig(raw);
   const parsed = paperclipConfigSchema.safeParse(migrated);
   if (!parsed.success) {

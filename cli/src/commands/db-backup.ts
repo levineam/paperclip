@@ -1,7 +1,12 @@
 import path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { formatDatabaseBackupResult, runDatabaseBackup } from "@paperclipai/db";
+import {
+  formatDatabaseBackupResult,
+  resolveBackupOutputGuard,
+  runDatabaseBackup,
+  type BackupOutputGuard,
+} from "@paperclipai/db";
 import {
   expandHomePrefix,
   resolveDefaultBackupDir,
@@ -15,8 +20,29 @@ type DbBackupOptions = {
   dir?: string;
   retentionDays?: number;
   filenamePrefix?: string;
+  expectedVolumeUuid?: string;
   json?: boolean;
 };
+
+/**
+ * Guard opt-in precedence: --expected-volume-uuid, then
+ * PAPERCLIP_DB_BACKUP_EXPECTED_VOLUME_UUID, then config. A present but blank or
+ * malformed value throws instead of running unguarded.
+ */
+export function resolveDbBackupOutputGuard(
+  flagValue: string | undefined,
+  configValue: unknown,
+  env: NodeJS.ProcessEnv = process.env,
+): BackupOutputGuard | undefined {
+  if (flagValue !== undefined) {
+    return resolveBackupOutputGuard({ env: flagValue, envName: "--expected-volume-uuid" });
+  }
+  return resolveBackupOutputGuard({
+    env: env.PAPERCLIP_DB_BACKUP_EXPECTED_VOLUME_UUID,
+    envName: "PAPERCLIP_DB_BACKUP_EXPECTED_VOLUME_UUID",
+    config: configValue,
+  });
+}
 
 function resolveConnectionString(configPath?: string): { value: string; source: string } {
   const envUrl = process.env.DATABASE_URL?.trim();
@@ -61,11 +87,13 @@ export async function dbBackupCommand(opts: DbBackupOptions): Promise<void> {
     config?.database.backup.retentionDays ?? 30,
   );
   const filenamePrefix = opts.filenamePrefix?.trim() || "paperclip";
+  const outputGuard = resolveDbBackupOutputGuard(opts.expectedVolumeUuid, config?.database.backup.expectedVolumeUuid);
 
   p.log.message(pc.dim(`Config: ${configPath}`));
   p.log.message(pc.dim(`Connection source: ${connection.source}`));
   p.log.message(pc.dim(`Backup dir: ${backupDir}`));
   p.log.message(pc.dim(`Retention: ${retentionDays} day(s)`));
+  if (outputGuard) p.log.message(pc.dim(`Output guard: volume ${outputGuard.expectedVolumeUuid}`));
 
   const spinner = p.spinner();
   spinner.start("Creating database backup...");
@@ -75,6 +103,7 @@ export async function dbBackupCommand(opts: DbBackupOptions): Promise<void> {
       backupDir,
       retention: { dailyDays: retentionDays, weeklyWeeks: 4, monthlyMonths: 1 },
       filenamePrefix,
+      ...(outputGuard ? { outputGuard } : {}),
     });
     spinner.stop(`Backup saved: ${formatDatabaseBackupResult(result)}`);
 
