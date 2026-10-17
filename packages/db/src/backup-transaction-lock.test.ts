@@ -15,6 +15,7 @@ import {
   assertStorageTransactionLockHeld,
   checkStorageTransactionLiveness,
   isStorageTransactionReservedName,
+  markStorageTransactionParticipationReady,
   parseStorageTransactionOwnerRecord,
   readLocalBootId,
   readLocalMachineId,
@@ -112,6 +113,25 @@ async function waitForPidExit(pid: number, timeoutMs = 10_000): Promise<void> {
     if (Date.now() > deadline) throw new Error(`Timed out waiting for pid ${pid} to exit`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
+}
+
+/** Ordinary (non-reserved) backup-like leftovers in a source root. */
+function backupLikeLeftovers(root: string): string[] {
+  return fs.readdirSync(root)
+    .filter((name) => !isStorageTransactionReservedName(name))
+    .filter((name) => name.endsWith(".sql") || name.endsWith(".sql.gz"))
+    .sort();
+}
+
+/**
+ * Qualified disposition of a KNOWN synthetic residual: only the exact file and bytes
+ * this test created are accepted and removed; anything else fails the test.
+ */
+function disposeKnownSyntheticResidual(root: string, residual: string, bytes: string): void {
+  expect(backupLikeLeftovers(root)).toEqual([path.basename(residual)]);
+  expect(fs.readFileSync(residual, "utf8")).toBe(bytes);
+  fs.unlinkSync(residual);
+  expect(backupLikeLeftovers(root)).toEqual([]);
 }
 
 function childExit(child: ChildProcess): Promise<number | null> {
@@ -417,6 +437,50 @@ describe("paperclip.storage-transaction-lock/v1", () => {
     }
     expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "ready", token: handle.token });
   });
+
+  it("keeps a declared-unresolved marker active across a later released transaction", () => {
+    const root = tempDir("paperclip-tx-lock-carry-");
+    const first = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+    releaseStorageTransactionLock(first, { participationState: "active" });
+    expect(fs.existsSync(first.ownerPath)).toBe(false);
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "active", token: first.token });
+
+    // A later transaction that ends normally (requests ready) must not clear it.
+    const later = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "active", token: later.token });
+    releaseStorageTransactionLock(later);
+    expect(fs.existsSync(later.ownerPath)).toBe(false);
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "active", token: later.token });
+  });
+
+  it("publishes ready only through explicit recovery after a verified known-residual disposition", () => {
+    const root = tempDir("paperclip-tx-lock-explicit-recovery-");
+    const residual = path.join(root, "paperclip-20260101-000000.sql");
+    const residualBytes = "synthetic partial\n";
+    fs.writeFileSync(residual, residualBytes);
+    const failed = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+    releaseStorageTransactionLock(failed, { participationState: "active" });
+
+    disposeKnownSyntheticResidual(root, residual, residualBytes);
+
+    const recovery = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+    markStorageTransactionParticipationReady(recovery);
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "ready", token: recovery.token });
+    releaseStorageTransactionLock(recovery);
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "ready", token: recovery.token });
+  });
+
+  it("treats a malformed or incompatible previous marker as unresolved", () => {
+    for (const previous of ["{not json\n", `${JSON.stringify({ schema: "other/v9", state: "ready" })}\n`]) {
+      const root = tempDir("paperclip-tx-lock-malformed-marker-");
+      fs.writeFileSync(path.join(resolveSourceRootRealPath(root), STORAGE_TRANSACTION_PARTICIPATION_NAME), previous);
+
+      const handle = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+      expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "active", token: handle.token });
+      releaseStorageTransactionLock(handle);
+      expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "active", token: handle.token });
+    }
+  });
 });
 
 describe("storage transaction cross-process exclusion", () => {
@@ -456,6 +520,10 @@ describe("storage transaction cross-process exclusion", () => {
 
     fs.writeFileSync(start, "go\n");
     await waitFor(acquired);
+    // Known synthetic output left behind by the transaction that is about to die.
+    const residual = path.join(root, "paperclip-20260101-000000.sql");
+    const residualBytes = "dead owner partial\n";
+    fs.writeFileSync(residual, residualBytes);
     const ownerPid = Number(fs.readFileSync(acquired, "utf8").trim());
     const deadToken = JSON.parse(
       fs.readFileSync(path.join(resolveSourceRootRealPath(root), STORAGE_TRANSACTION_LOCK_DIR_NAME), "utf8"),
@@ -475,6 +543,16 @@ describe("storage transaction cross-process exclusion", () => {
     } finally {
       releaseStorageTransactionLock(recovered);
     }
-    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "ready", token: recovered.token });
+    // Owner recovery is not data recovery: the dead transaction's output keeps the
+    // directory unarchivable (KTD9) and survives untouched.
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "active", token: recovered.token });
+    expect(fs.readFileSync(residual, "utf8")).toBe(residualBytes);
+
+    // Ready only after a separately qualified disposition of the known synthetic residual.
+    disposeKnownSyntheticResidual(root, residual, residualBytes);
+    const verified = acquireStorageTransactionLock({ sourceRoot: root, operationKind: "backup" });
+    markStorageTransactionParticipationReady(verified);
+    releaseStorageTransactionLock(verified);
+    expect(readStorageTransactionParticipation(root)).toMatchObject({ state: "ready", token: verified.token });
   }, 30_000);
 });

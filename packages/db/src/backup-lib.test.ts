@@ -1,9 +1,16 @@
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { gunzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  runDatabaseBackup,
+  runDatabaseRestore,
+  runPgDumpBackup,
+} from "./backup-lib.js";
 import {
   STORAGE_TRANSACTION_LOCK_DIR_NAME,
   STORAGE_TRANSACTION_PARTICIPATION_NAME,
@@ -43,6 +50,121 @@ async function createSiblingDatabase(connectionString: string, databaseName: str
   const targetUrl = new URL(connectionString);
   targetUrl.pathname = `/${databaseName}`;
   return targetUrl.toString();
+}
+
+const RETENTION = { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 };
+const UNREACHABLE_DATABASE_URL = "postgres://paperclip:paperclip@127.0.0.1:1/paperclip";
+
+function setEnv(name: string, value: string): void {
+  const previous = process.env[name];
+  process.env[name] = value;
+  cleanups.push(() => {
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
+  });
+}
+
+type HeldStdoutBarrier = { mainPid: string; release: string; done: string };
+
+/**
+ * Owned fake pg_dump: a background descendant keeps stdout open until the release
+ * barrier (bounded ~10 s escape, so nothing leaks after a failed assertion), while
+ * pg_dump itself records its PID and exits 3 immediately.
+ */
+function installHeldStdoutPgDump(dir: string): HeldStdoutBarrier {
+  const barrier = {
+    mainPid: path.join(dir, "main.pid"),
+    release: path.join(dir, "release.barrier"),
+    done: path.join(dir, "producer-done"),
+  };
+  setEnv("PAPERCLIP_TEST_PGDUMP_MAIN_PID", barrier.mainPid);
+  setEnv("PAPERCLIP_TEST_PGDUMP_RELEASE", barrier.release);
+  setEnv("PAPERCLIP_TEST_PGDUMP_DONE", barrier.done);
+  const script = path.join(dir, "pg_dump");
+  fs.writeFileSync(script, [
+    "#!/bin/sh",
+    "(",
+    "  i=0",
+    "  while [ ! -e \"$PAPERCLIP_TEST_PGDUMP_RELEASE\" ] && [ \"$i\" -lt 200 ]; do sleep 0.05; i=$((i + 1)); done",
+    "  printf 'SELECT 1;\\n'",
+    "  echo done > \"$PAPERCLIP_TEST_PGDUMP_DONE\"",
+    ") &",
+    // Publish the PID atomically: a same-directory temp file renamed into place, so the
+    // barrier file never exists empty.
+    "echo $$ > \"$PAPERCLIP_TEST_PGDUMP_MAIN_PID.$$.tmp\"",
+    "mv \"$PAPERCLIP_TEST_PGDUMP_MAIN_PID.$$.tmp\" \"$PAPERCLIP_TEST_PGDUMP_MAIN_PID\"",
+    "exit 3",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  setEnv("PAPERCLIP_PG_DUMP_PATH", script);
+  return barrier;
+}
+
+async function waitForFile(file: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(file)) {
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for ${file}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** pg_dump itself has exited: gone (reaped) or a not-yet-reaped zombie. */
+async function waitForProcessExited(pid: number, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw error;
+    }
+    const state = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout?.trim() ?? "";
+    if (state.startsWith("Z")) return;
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for pid ${pid} to exit`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+/** Bounded observation: `violated()` must stay false for the whole window. */
+async function expectStaysPending(violated: () => boolean, windowMs = 1_000): Promise<void> {
+  const deadline = Date.now() + windowMs;
+  while (Date.now() < deadline) {
+    expect(violated()).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  expect(violated()).toBe(false);
+}
+
+function readMarker(dir: string): Record<string, unknown> {
+  return JSON.parse(fs.readFileSync(path.join(dir, STORAGE_TRANSACTION_PARTICIPATION_NAME), "utf8"));
+}
+
+function backupLikeEntries(dir: string): string[] {
+  return fs.readdirSync(dir).filter((name) => name.endsWith(".sql") || name.endsWith(".sql.gz")).sort();
+}
+
+/**
+ * Attempt A: a residual directory occupies the pinned output name so cleanup cannot
+ * remove it; the run fails and leaves the marker active with A's partial in place.
+ */
+async function failAttemptLeavingResidual(backupDir: string): Promise<string> {
+  vi.setSystemTime(new Date(2026, 8, 11, 12, 0, 0));
+  const residual = path.join(backupDir, "paperclip-20260911-120000.sql.gz");
+  fs.mkdirSync(residual);
+  fs.writeFileSync(path.join(residual, "keep"), "partial-a\n");
+  try {
+    await expect(runDatabaseBackup({
+      connectionString: UNREACHABLE_DATABASE_URL,
+      backupDir,
+      retention: RETENTION,
+      backupEngine: "javascript",
+      connectTimeoutSeconds: 1,
+    })).rejects.toBeInstanceOf(AggregateError);
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(readMarker(backupDir)).toMatchObject({ state: "active" });
+  return residual;
 }
 
 afterEach(async () => {
@@ -182,6 +304,125 @@ describe("runDatabaseBackup transaction teardown", () => {
     }
     expect(fs.existsSync(held.ownerPath)).toBe(false);
   });
+
+  it("keeps an earlier attempt's partial and active marker after a later failed attempt", async () => {
+    const backupDir = createTempDir("paperclip-db-backup-carry-failed-");
+    const residual = await failAttemptLeavingResidual(backupDir);
+
+    // Attempt B: a different (real-time) file name; it fails and removes only its own files.
+    await expect(runDatabaseBackup({
+      connectionString: UNREACHABLE_DATABASE_URL,
+      backupDir,
+      retention: RETENTION,
+      backupEngine: "javascript",
+      connectTimeoutSeconds: 1,
+    })).rejects.toThrow();
+
+    expect(fs.readFileSync(path.join(residual, "keep"), "utf8")).toBe("partial-a\n");
+    expect(backupLikeEntries(backupDir)).toEqual([path.basename(residual)]);
+    expect(fs.existsSync(path.join(backupDir, STORAGE_TRANSACTION_LOCK_DIR_NAME))).toBe(false);
+    expect(readMarker(backupDir)).toMatchObject({ state: "active" });
+  });
+});
+
+describe("runPgDumpBackup settlement", () => {
+  it("does not reject in default mode until every holder of pg_dump's stdout has finished", async () => {
+    const dir = createTempDir("paperclip-pgdump-settle-default-");
+    const barrier = installHeldStdoutPgDump(dir);
+    const state: { outcome: { error: unknown } | null } = { outcome: null };
+    // Default (non-exclusive) mode: no onExclusiveCreate.
+    const running = runPgDumpBackup({
+      connectionString: "postgres://unused",
+      backupFile: path.join(dir, "out.sql.gz"),
+      connectTimeout: 1,
+    }).then(
+      () => { state.outcome = { error: null }; },
+      (error: unknown) => { state.outcome = { error }; },
+    );
+    try {
+      await waitForFile(barrier.mainPid);
+      await waitForProcessExited(Number(fs.readFileSync(barrier.mainPid, "utf8").trim()));
+      // pg_dump has exited non-zero; its descendant still holds stdout until released.
+      await expectStaysPending(() => state.outcome !== null || fs.existsSync(barrier.done));
+    } finally {
+      fs.writeFileSync(barrier.release, "go\n");
+      await running;
+    }
+    expect(fs.existsSync(barrier.done)).toBe(true);
+    expect(state.outcome?.error).toBeInstanceOf(Error);
+    expect((state.outcome?.error as Error).message).toMatch(/exit code 3/);
+  }, 30_000);
+});
+
+describeEmbeddedPostgres("runDatabaseBackup", () => {
+  it(
+    "keeps the transaction lock until a failed default pg_dump's producers settle",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-pgdump-settle-");
+      const barrier = installHeldStdoutPgDump(createTempDir("paperclip-pgdump-barrier-"));
+      const ownerPath = path.join(backupDir, STORAGE_TRANSACTION_LOCK_DIR_NAME);
+      const state: { outcome: { error: unknown } | null } = { outcome: null };
+      const running = runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: RETENTION,
+        backupEngine: "pg_dump",
+      }).then(
+        () => { state.outcome = { error: null }; },
+        (error: unknown) => { state.outcome = { error }; },
+      );
+      try {
+        await waitForFile(barrier.mainPid);
+        await waitForProcessExited(Number(fs.readFileSync(barrier.mainPid, "utf8").trim()));
+        // Lock still held and nothing settled while the producer half is outstanding.
+        await expectStaysPending(() =>
+          state.outcome !== null || !fs.existsSync(ownerPath) || fs.existsSync(barrier.done));
+      } finally {
+        fs.writeFileSync(barrier.release, "go\n");
+        await running;
+      }
+      expect(fs.existsSync(barrier.done)).toBe(true);
+      expect((state.outcome?.error as Error).message).toMatch(/exit code 3/);
+      expect(fs.existsSync(ownerPath)).toBe(false);
+      expect(readMarker(backupDir)).toMatchObject({ state: "ready" });
+      expect(backupLikeEntries(backupDir)).toEqual([]);
+    },
+    60_000,
+  );
+
+  it(
+    "keeps an earlier attempt's partial and active marker after a later successful backup",
+    async () => {
+      const connectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-carry-success-");
+      const residual = await failAttemptLeavingResidual(backupDir);
+      // Retention evidence: an old prunable backup that the successful run must delete.
+      const oldBackup = path.join(backupDir, "paperclip-20200101-000000.sql.gz");
+      fs.writeFileSync(oldBackup, "old");
+      const old = new Date(Date.UTC(2020, 0, 1));
+      fs.utimesSync(oldBackup, old, old);
+
+      const result = await runDatabaseBackup({
+        connectionString,
+        backupDir,
+        retention: RETENTION,
+        backupEngine: "javascript",
+      });
+
+      expect(path.basename(result.backupFile)).not.toBe(path.basename(residual));
+      expect(gunzipSync(fs.readFileSync(result.backupFile)).toString("utf8")).toContain("-- Paperclip database backup");
+      expect(result.prunedCount).toBe(1);
+      expect(fs.existsSync(oldBackup)).toBe(false);
+      expect(fs.readFileSync(path.join(residual, "keep"), "utf8")).toBe("partial-a\n");
+      expect(backupLikeEntries(backupDir)).toEqual([path.basename(residual), path.basename(result.backupFile)].sort());
+      expect(fs.existsSync(path.join(backupDir, STORAGE_TRANSACTION_LOCK_DIR_NAME))).toBe(false);
+      const marker = readMarker(backupDir);
+      expect(marker).toMatchObject({ state: "active" });
+      expect(String(marker.token).startsWith(result.lockTokenPrefix ?? "missing")).toBe(true);
+    },
+    60_000,
+  );
 });
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {

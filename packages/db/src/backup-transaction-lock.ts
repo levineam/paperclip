@@ -65,6 +65,14 @@ export type StorageTransactionLockHandle = {
   token: string;
   owner: StorageTransactionOwnerRecord;
   recoveries?: Array<Record<string, unknown>>;
+  /**
+   * In-memory only (never written to disk). True when, at acquisition under this
+   * owner lock, the previous participation marker was active, malformed or
+   * unreadable: an earlier transaction may have left unresolved output. Release
+   * then keeps the marker active instead of publishing ready, on every acquisition
+   * path including dead-owner recovery.
+   */
+  inheritedUnresolvedParticipation?: boolean;
 };
 
 export type AcquireStorageTransactionLockOptions = {
@@ -288,6 +296,20 @@ function readParticipationRecord(filePath: string): StorageTransactionParticipat
     );
   }
   return parsed;
+}
+
+/**
+ * Whether the participation marker left by the previous transaction signals possibly
+ * unresolved output: active, or not a valid v1 marker at all (fail closed). Missing or
+ * ready is resolved. Read only; never rewrites or deletes anything.
+ */
+function previousParticipationUnresolved(participationPath: string): boolean {
+  try {
+    const previous = readParticipationRecord(participationPath);
+    return previous !== null && previous.state !== "ready";
+  } catch {
+    return true;
+  }
 }
 
 export function checkStorageTransactionLiveness(
@@ -528,6 +550,9 @@ export function acquireStorageTransactionLock(
     } finally {
       safeUnlink(temp);
     }
+    // Now holding the owner lock, and before our own active marker replaces it, read
+    // what the previous transaction left. Same rule on every acquisition path.
+    const inheritedUnresolvedParticipation = previousParticipationUnresolved(paths.participationPath);
     try {
       writeParticipation(paths, markerFor("active", token, nowMs));
     } catch (error) {
@@ -551,6 +576,7 @@ export function acquireStorageTransactionLock(
       token,
       owner,
       recoveries,
+      inheritedUnresolvedParticipation,
     };
   };
 
@@ -616,17 +642,27 @@ export function assertStorageTransactionLockHeld(handle: StorageTransactionLockH
   return current;
 }
 
+/**
+ * Explicitly publish a ready marker for the held lock. This does NOT verify or recover
+ * any data: the caller must first have independently accounted for every ordinary
+ * (non-reserved) leftover in the source root, e.g. partial output from an earlier
+ * failed or dead transaction. Only after that write succeeds does a following
+ * release keep ready for a handle that inherited unresolved participation.
+ */
 export function markStorageTransactionParticipationReady(
   handle: StorageTransactionLockHandle,
   nowMs: number = Date.now(),
 ): void {
   assertStorageTransactionLockHeld(handle);
   writeParticipation(ownerPaths(handle.sourceRootRealPath), markerFor("ready", handle.token, nowMs));
+  handle.inheritedUnresolvedParticipation = false;
 }
 
 /**
  * Token-safe release: removes only this holder's owner record and leaves a
- * ready participation marker for enrolled archive consumers.
+ * ready participation marker for enrolled archive consumers, unless the caller
+ * requests active or the handle inherited unresolved participation, in which case
+ * the existing active marker is left in place.
  */
 export function releaseStorageTransactionLock(
   handle: StorageTransactionLockHandle,
@@ -645,7 +681,9 @@ export function releaseStorageTransactionLock(
         { sourceRootRealPath: handle.sourceRootRealPath },
       );
     }
-    if ((options.participationState || "ready") === "ready") {
+    // Earlier unresolved participation is never cleared by a later transaction ending
+    // normally; only explicit markStorageTransactionParticipationReady can clear it.
+    if ((options.participationState || "ready") === "ready" && !handle.inheritedUnresolvedParticipation) {
       writeParticipation(paths, markerFor("ready", handle.token, Date.now()));
     }
     const retired = retireRecord(paths.ownerPath, paths.sourceRootRealPath, "release", handle.token);

@@ -489,13 +489,10 @@ export async function runPgDumpBackup(opts: {
     exclusiveOutput ? exclusiveOutput.createWriteStream() : createWriteStream(opts.backupFile),
   );
   const exit = waitForChildExit(child, pgDumpBin);
-  if (!exclusiveOutput) {
-    await Promise.all([output, exit]);
-    return;
-  }
-  // Guarded: never return (and so never clean up, fall back, or release the lock)
-  // while pg_dump or anything holding its stdout is still producing output. A failed
-  // pipeline destroys stdout, so a writing producer ends via EPIPE; there is no kill.
+  // In every mode, never return (and so never clean up, fall back, or release the
+  // lock) while pg_dump or anything holding its stdout is still producing output.
+  // A failed pipeline destroys stdout, so a writing producer ends via EPIPE; there is
+  // no kill. The exit error (with pg_dump's stderr) wins over the output error.
   const [outputResult, exitResult] = await Promise.allSettled([output, exit]);
   if (exitResult.status === "rejected") throw exitResult.reason;
   if (outputResult.status === "rejected") throw outputResult.reason;

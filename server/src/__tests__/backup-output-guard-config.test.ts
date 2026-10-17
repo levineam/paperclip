@@ -5,7 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const UUID_A = "11111111-2222-4333-8444-555555555555";
 const UUID_B = "99999999-8888-4777-8666-555555555555";
-const ENV_NAMES = ["PAPERCLIP_CONFIG", "PAPERCLIP_DB_BACKUP_EXPECTED_VOLUME_UUID"] as const;
+const ENV_NAMES = [
+  "PAPERCLIP_CONFIG",
+  "PAPERCLIP_DB_BACKUP_EXPECTED_VOLUME_UUID",
+  "PAPERCLIP_HOME",
+  "PAPERCLIP_INSTANCE_ID",
+  "PAPERCLIP_IN_WORKTREE",
+] as const;
 
 let tempDir = "";
 const savedEnv = Object.fromEntries(ENV_NAMES.map((name) => [name, process.env[name]]));
@@ -27,6 +33,70 @@ async function loadBackupGuard(): Promise<string | undefined> {
   vi.resetModules();
   const { loadConfig } = await import("../config.js");
   return loadConfig().databaseBackupExpectedVolumeUuid;
+}
+
+function errnoError(code: string, syscall: string, target: string): Error {
+  return Object.assign(new Error(`${code}: ${syscall} '${target}'`), { code, syscall, path: target });
+}
+
+/**
+ * loadConfig with no override: cwd is a project subdirectory under the temp dir,
+ * every config.json outside the temp dir reads as absent (no real home or ancestor
+ * config is touched), and, when `denyProjectConfig` is set, the project's
+ * .paperclip/config.json is uninspectable (EACCES) at the OS boundary.
+ */
+async function loadBackupGuardWithDiscovery(options: { denyProjectConfig: boolean }): Promise<string | undefined> {
+  delete process.env.PAPERCLIP_CONFIG;
+  process.env.PAPERCLIP_HOME = path.join(tempDir, "home");
+  process.env.PAPERCLIP_INSTANCE_ID = "default";
+  process.env.PAPERCLIP_IN_WORKTREE = "false";
+  const projectRoot = path.join(tempDir, "project");
+  const workDir = path.join(projectRoot, "work");
+  fs.mkdirSync(workDir, { recursive: true });
+  const projectConfig = path.join(projectRoot, ".paperclip", "config.json");
+  if (options.denyProjectConfig) {
+    fs.mkdirSync(path.dirname(projectConfig), { recursive: true });
+    fs.writeFileSync(projectConfig, configJson({ expectedVolumeUuid: UUID_A }));
+  }
+  const root = tempDir;
+  vi.doMock("node:fs", async (importOriginal) => {
+    const actual = await importOriginal<typeof import("node:fs")>();
+    const classify = (target: unknown): "deny" | "absent" | null => {
+      if (typeof target !== "string" || path.basename(target) !== "config.json") return null;
+      const resolved = path.resolve(target);
+      if (options.denyProjectConfig && resolved === projectConfig) return "deny";
+      if (!resolved.startsWith(`${root}${path.sep}`)) return "absent";
+      return null;
+    };
+    const statSync = ((target: unknown, ...rest: unknown[]) => {
+      const kind = classify(target);
+      if (kind === "deny") throw errnoError("EACCES", "stat", String(target));
+      if (kind === "absent") throw errnoError("ENOENT", "stat", String(target));
+      return (actual.statSync as (...args: unknown[]) => unknown)(target, ...rest);
+    }) as typeof actual.statSync;
+    const existsSync = ((target: unknown) =>
+      classify(target) ? false : actual.existsSync(target as Parameters<typeof actual.existsSync>[0])) as typeof actual.existsSync;
+    const readFileSync = ((target: unknown, ...rest: unknown[]) => {
+      const kind = classify(target);
+      if (kind === "deny") throw errnoError("EACCES", "open", String(target));
+      if (kind === "absent") throw errnoError("ENOENT", "open", String(target));
+      return (actual.readFileSync as (...args: unknown[]) => unknown)(target, ...rest);
+    }) as typeof actual.readFileSync;
+    const patched = { statSync, existsSync, readFileSync };
+    return { ...actual, ...patched, default: { ...actual, ...patched } };
+  });
+  // Only config discovery (server/src/paths.ts) sees the synthetic project cwd; the
+  // test runner's own module resolution keeps the real cwd.
+  const realCwd = process.cwd.bind(process);
+  const cwdSpy = vi.spyOn(process, "cwd").mockImplementation(() =>
+    (new Error().stack ?? "").includes(`${path.sep}src${path.sep}paths.ts`) ? workDir : realCwd());
+  try {
+    // loadConfig() completing at all shows server config/startup still works.
+    return await loadBackupGuard();
+  } finally {
+    cwdSpy.mockRestore();
+    vi.doUnmock("node:fs");
+  }
 }
 
 beforeEach(() => {
@@ -124,5 +194,13 @@ describe("server backup output guard config", () => {
   it("keeps the opt-in present when an unparseable config mentions the guard", async () => {
     writeConfig(`{ "database": { "backup": { "expectedVolumeUuid": "${UUID_A}" } }`);
     expect(await loadBackupGuard()).toBe("");
+  });
+
+  it("refuses backups when an ancestor config cannot be inspected and no override is given", async () => {
+    expect(await loadBackupGuardWithDiscovery({ denyProjectConfig: true })).toBe("");
+  });
+
+  it("stays unguarded when no project config exists anywhere and no override is given", async () => {
+    expect(await loadBackupGuardWithDiscovery({ denyProjectConfig: false })).toBeUndefined();
   });
 });

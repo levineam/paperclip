@@ -14,8 +14,15 @@ function findConfigFileFromAncestors(startDir: string): string | null {
 
   while (true) {
     const candidate = path.resolve(currentDir, ".paperclip", DEFAULT_CONFIG_BASENAME);
-    if (fs.existsSync(candidate)) {
+    try {
+      fs.statSync(candidate);
       return candidate;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code;
+      // Only genuine absence keeps searching. Any other inspection error (EACCES, ...)
+      // returns this uncertain candidate so readConfig fails closed instead of the
+      // search silently falling back to the default config.
+      if (code !== "ENOENT" && code !== "ENOTDIR") return candidate;
     }
 
     const nextDir = path.resolve(currentDir, "..");

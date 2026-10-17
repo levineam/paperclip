@@ -667,22 +667,46 @@ An existing config file that cannot be read, is not valid JSON, or fails validat
 treated as uncertain (it might carry the guard in any spelling): the server keeps
 serving but refuses all backups until the file is fixed, `pnpm db:backup` (which also
 rejects a non-object `database`/`database.backup`) and `paperclipai db:backup` exit
-before creating anything. This applies even when the guard is not configured.
+before creating anything. This applies even when the guard is not configured. The same
+holds for config discovery without `--config`/`PAPERCLIP_CONFIG`: an ancestor
+`.paperclip/config.json` that exists but cannot be inspected (e.g. EACCES) is used as
+the (uncertain) config path instead of being skipped in favour of the default config,
+so the CLI fails and the server refuses backups. Only a genuinely missing candidate
+(ENOENT/ENOTDIR) continues the search.
 
 It fails closed, creating, writing and deleting nothing outside the verified directory,
 when the volume is absent, the UUID resolves to a different or unverifiable volume, the
 dir is outside the volume, a component is a symlink, the platform isn't macOS, or the
 configured value is blank, `null`, or otherwise malformed (it never falls back to an
-unguarded backup). A guarded `pg_dump` run also waits for pg_dump and its output
-stream to both finish before any cleanup, fallback, or lock release. If
+unguarded backup). If
 detection happens after the run starts, its own partial files in the original
 directory are cleaned up and the lock is released there; if a partial file can't be
 removed, the participation marker stays `active` as usual. With the guard set,
 `filenamePrefix` must match `[A-Za-z0-9][A-Za-z0-9._-]*`.
 
-Without the setting, behavior is unchanged. Worktree seed backups (`paperclipai
-worktree init`) write to their own seed destination and stay unguarded unless that
-caller passes an explicit guard.
+Without the setting, the guard itself does not apply. Worktree seed backups
+(`paperclipai worktree init`) write to their own seed destination and stay unguarded
+unless that caller passes an explicit guard. The following transaction rules apply
+to every backup, guarded or not:
+
+- Every `pg_dump` run (explicit `pg_dump` or `auto`, guarded or not) waits for both
+  pg_dump to exit and its output stream to finish before any cleanup, `auto` fallback,
+  or lock release. A failed output stream ends a still-writing producer via EPIPE;
+  nothing is killed, so a producer that hangs without writing keeps the run waiting.
+  When both fail, pg_dump's exit error (with its stderr) is reported.
+- Once a transaction leaves the participation marker `active` (a partial file it could
+  not remove, a process that died holding the lock, or a malformed/unreadable marker),
+  the marker stays `active` across every later backup, failed or successful, and across
+  dead-owner lock recovery. Recovering a dead lock owner is not data recovery. Archive
+  consumers therefore keep refusing the directory.
+- Nothing is deleted to get back to `ready`. The only way back is explicit:
+  `markStorageTransactionParticipationReady(handle)` (from `@paperclipai/db`, called
+  while holding the lock). It does not verify or recover any data. Before calling it,
+  an operator must hold the lock, list every ordinary (non-`.paperclip-stx-`) file
+  matching the backup prefix, and account for each one (confirmed complete, or moved
+  aside by a person). There is no built-in operator command for this.
+- These rules don't make the directory atomic or guarantee no orphaned files; they
+  keep archive eligibility fail-closed while any may exist.
 
 DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if

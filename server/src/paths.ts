@@ -11,8 +11,15 @@ function findConfigFileFromAncestors(startDir: string): string | null {
 
   while (true) {
     const candidate = path.resolve(currentDir, ".paperclip", PAPERCLIP_CONFIG_BASENAME);
-    if (fs.existsSync(candidate)) {
+    try {
+      fs.statSync(candidate);
       return candidate;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | null)?.code;
+      // Only genuine absence keeps searching. Any other inspection error (EACCES, ...)
+      // returns this uncertain candidate: readers then see a non-ENOENT error, so the
+      // server keeps serving but refuses backups instead of using the default config.
+      if (code !== "ENOENT" && code !== "ENOTDIR") return candidate;
     }
 
     const nextDir = path.resolve(currentDir, "..");
