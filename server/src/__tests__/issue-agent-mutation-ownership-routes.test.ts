@@ -333,16 +333,21 @@ function createRunContextDb(
   };
 }
 
+// Fresh per case: loaded at the end of each beforeEach, after that case's module
+// reset and route mock registration, so module loading is fixture setup and each
+// case's behavioral timeout covers only app mounting, requests, and assertions.
+let routeModules: [
+  typeof import("../middleware/index.js"),
+  typeof import("../routes/issues.js"),
+];
+
 async function createApp(actor: Record<string, unknown>, db?: unknown) {
   const routeDb = db ?? createRunContextDb(
     {},
     typeof actor.agentId === "string" ? actor.agentId : ownerAgentId,
     typeof actor.runId === "string" ? actor.runId : ownerRunId,
   );
-  const [{ errorHandler }, { issueRoutes }] = await Promise.all([
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-  ]);
+  const [{ errorHandler }, { issueRoutes }] = routeModules;
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -386,7 +391,7 @@ function boardActor() {
 }
 
 describe("agent issue mutation checkout ownership", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -700,6 +705,10 @@ describe("agent issue mutation checkout ownership", () => {
       contentLength: 6,
     });
     mockStorageService.deleteObject.mockResolvedValue(undefined);
+    routeModules = await Promise.all([
+      vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+      vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
+    ]);
   });
 
   it("denies company-wide issue list routes for task bridge keys", async () => {
